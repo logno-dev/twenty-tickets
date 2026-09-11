@@ -1,162 +1,195 @@
 # Twenty Tickets
 
-A Go service for Resend inbound email webhooks, packaged for Docker and Coolify.
+One Go service receives Resend email webhooks and creates records in one or more Twenty instances. A built-in admin UI manages connections, inbound recipient routes, and field mappings using Twenty's object metadata. Docker/Coolify deployment needs no separate frontend or database container.
 
-**Flow:** verify the webhook → fetch the received email → extract the sender's note and first forwarded message → save a durable draft → create a Twenty ticket. A background worker delivers saved drafts when Twenty credentials are configured.
+## Quick start in Coolify
 
-## Request flow
+1. Deploy this repository with the **Dockerfile** build pack.
+2. Set the exposed/container port and `PORT` to **8080**.
+3. Assign an HTTPS domain, for example `https://tickets.example.com`. Coolify handles TLS and routes to the container over HTTP.
+4. Mount persistent storage at **`/data`**. The container runs as UID/GID **10001:10001**, which must be able to write to the mount. A fresh named Docker volume inherits the image directory's ownership; existing bind mounts may need their ownership adjusted.
+5. Add these **runtime** environment variables (disable Build Variable for credentials):
 
-1. Resend sends `email.received` to `POST /webhooks/resend`.
-2. The official Svix Go library verifies the signature against the **raw body**, including its timestamp tolerance. Keep the server clock synchronized.
-   When `INBOUND_EMAIL_TO` is set, unrelated To recipients are ignored with `204`. Verified webhook recipients are checked before fetching when present, and the fetched email's To recipients are checked before saving.
-3. The service checks whether the email ID already exists in its inbox.
-4. It calls `GET https://api.resend.com/emails/receiving/{email_id}?html_format=cid` using the Resend API key. The `cid` option avoids large base64 inline images; extraction uses the response's `text` field.
-5. It extracts the newest useful content and atomically saves a JSON file before returning `204`.
-6. With Twenty configured, a worker scans the inbox on startup and five seconds after each pass, creates pending tickets, and saves delivery receipts. This includes pending drafts saved by the earlier inbox-only version.
+   ```env
+   RESEND_API_KEY=re_your_key
+   RESEND_WEBHOOK_SECRET=whsec_your_signing_secret
+   ADMIN_USERNAME=admin
+   ADMIN_PASSWORD=your_long_unique_password
+   PORT=8080
+   DATA_DIR=/data
+   ```
 
-Resend retrieval/inbox storage failures return `503`, allowing webhook retries. Invalid signatures return `401`; invalid events return `400`; webhook bodies over 1 MiB return `413`. Verified unrelated event types return `204`. API requests have a 10-second timeout and a 16 MiB response limit. Use Resend's delivery log to inspect and replay webhook failures. Twenty failures are retried independently from the persistent inbox, so a Twenty outage does not depend on Resend's webhook retry window.
+6. Deploy and visit **`https://tickets.example.com/admin/`**. Your browser prompts for the admin username and password using HTTP Basic authentication. Use HTTPS for the public admin URL.
+7. Add a Twenty connection and a route as described below.
+8. In Resend, point an `email.received` webhook to **`https://tickets.example.com/webhooks/resend`**.
+
+The root `/` redirects to `/admin/`. `GET /healthz` is a public liveness check; configure it on port 8080 in Coolify. The image also includes a Docker health check. Allow at least 25 seconds for graceful shutdown.
+
+## Environment variables
+
+| Variable | Required | Meaning |
+| --- | --- | --- |
+| `RESEND_API_KEY` | Yes | Permission to retrieve received emails |
+| `RESEND_WEBHOOK_SECRET` | Yes | This endpoint's Resend signing secret |
+| `ADMIN_USERNAME` | Yes | Admin UI username; cannot contain `:` |
+| `ADMIN_PASSWORD` | Yes | Admin UI password |
+| `PORT` | No | `8080` |
+| `DATA_DIR` | No | `./data` natively; `/data` in the Docker image |
+
+**Twenty credentials and inbound addresses are now managed in the UI.** `TWENTY_BASE_URL`, `TWENTY_API_KEY`, and `INBOUND_EMAIL_TO` are no longer used. Changing the admin password does not change the encryption key for saved Twenty credentials.
+
+## Admin UI
+
+### Add a connection
+
+Choose **Add connection** and enter:
+
+- A friendly name, e.g. `Company A`.
+- The Twenty instance root URL, e.g. `https://crm.company-a.com`, without `/rest`.
+- Its API key.
+
+**Test connection & save / refresh schema** fetches all pages from `/rest/metadata/objects` and saves the connection only after that succeeds. Both the legacy `{data:{objects:[]}}` and newer `{data:[]}` envelopes are supported. The key needs metadata/data-model read access plus read/create permission on the target objects and mapped fields.
+
+Edit an existing connection to rotate its key or refresh cached metadata after changing your Twenty data model. Leave the key blank to retain it; saved keys are never displayed. Keep a connection associated with the same Twenty workspace when rotating keys. Its URL is immutable so pending deliveries cannot be redirected; add a new connection when changing instances.
+
+### Add a route
+
+Choose **Add route**:
+
+1. Select a connection, then **Load objects**.
+2. Select an object from its schema, then **Load fields**.
+3. Enter a route name and a specific inbound **To** email address.
+4. Choose each field's value source, enable the route, and save.
+
+Example:
+
+| Route | Inbound address | Connection | Object |
+| --- | --- | --- | --- |
+| Company A support | `support@company-a.com` | Company A | `tickets` |
+| Company B support | `support@company-b.com` | Company B | `tickets` |
+
+An email matching both routes produces one record per route. Multiple routes can also share one connection. Each route has its own stable record identity; two matching routes intentionally create two records even if they target the same object in the same workspace.
+
+Matching is case-insensitive and compares the complete mailbox. Display names are supported; plus tags and aliases are distinct. CC/BCC, senders, and headers inside forwarded text do not count. Routing uses Resend's outer `to` data, not SMTP-envelope or forwarding-header inference.
+
+### Field mapping
+
+| Source | Behavior |
+| --- | --- |
+| `default` | Omit the field; Twenty applies its configured default |
+| `subject` | Outer email subject, or `(No subject)` when blank |
+| `body` | Extracted introductory note and first forwarded/top message |
+| `from` | Outer sender string supplied by Resend |
+| `email_id` | Resend received-email ID |
+| `message_id` | Original email Message-ID |
+| `received_at` | Resend creation timestamp; date fields get its date component |
+| `fixed` | A configured value validated against the field type |
+| `empty` | Explicit JSON null, available only for nullable fields |
+
+For your Ticket object, the form suggests `name → subject` and `issueOrRequest → body`. Leave Status and Type on `default` to use Twenty's settings. The service does not require or automatically send `generated`; Twenty attributes creation to the API token.
+
+Supported typed mappings:
+
+- **Text / rich text:** fixed values or email-derived text. Rich text uses `{ "markdown": "..." }`; Twenty generates its editor representation.
+- **Select:** dropdown populated from metadata option values.
+- **Multi-select:** a JSON array of valid option values, e.g. `["BUG","REQUEST"]`; available values are shown in the form.
+- **Boolean:** true/false control.
+- **Number / numeric:** JSON number; integer metadata is validated as an integer.
+- **Date / date-time:** `YYYY-MM-DD` / RFC3339; fixed or received date/time.
+- **UUID:** a fixed record UUID.
+- **Many-to-one relations:** a fixed related-record UUID when metadata supplies `settings.joinColumnName`. For example, an App field maps to `appId`. This version accepts the UUID rather than browsing related records.
+
+System audit fields and ID are excluded. Other composite fields and to-many relationships currently support omission/default only. Unsupported required fields without defaults must be given a default in Twenty before this service can create that object. Server-side validation checks field names/types, select options, required fields, and nullability; the browser cannot substitute arbitrary API field names.
+
+Mappings are cached and snapshotted at intake. Refresh the connection and re-save the route after schema changes. Existing queued snapshots keep their original mapping, so avoid deleting their mapped fields until the backlog is delivered.
+
+### Delivery dashboard
+
+The home page shows connections, routes, and the latest 100 saved emails with per-route pending/retry/delivered state, record IDs, and retry errors/times. Disabling a route stops it from matching **new** email; it does not cancel deliveries already accepted for that route.
+
+## Upgrading from environment-based configuration
+
+1. Keep the existing `/data` volume and note your current Twenty URL/key and inbound address.
+2. Add `ADMIN_USERNAME` and `ADMIN_PASSWORD` to Coolify and deploy this version.
+3. Open `/admin/`, add the original Twenty connection, retrieve its metadata, and create its route. You can then remove the old Twenty/inbound environment variables.
+4. Add the second instance and its route when ready.
+
+While **no routes have been configured**, incoming received-email deliveries return `503` so Resend can retry during setup. Once routes exist, unmatched emails return `204` and are ignored. Replay any failed deliveries that exceeded Resend's retry window, and replay intentionally ignored emails if you later add a route for them.
+
+Previously saved version-1 drafts are not automatically sent to newly added destinations:
+
+- Previously delivered drafts remain delivered and are skipped.
+- Pending legacy drafts appear with **Assign legacy draft** on the dashboard. Choose an enabled Tickets route matching the draft's To address and pointing to its **original Twenty workspace**.
+- Assignment is one-time and snapshots the route. The original stable ticket ID is reused, so a previous successful creation whose receipt was lost is recovered rather than duplicated.
+- `needs_review` records remain available for manual inspection and are not automatically delivered.
+
+The old `check-twenty` CLI command is replaced by the connection form's test/refresh action. There is no automatic import of credentials from the old environment variables.
+
+## Processing and reliability
+
+1. Verify the raw webhook with the official Svix library, including timestamp tolerance.
+2. Check for an existing draft to deduplicate webhook deliveries.
+3. Match enabled routes using the signed event's To recipients when provided. Unmatched events are skipped before fetching content. If To is missing, retrieve the email first and route using its To recipients.
+4. Fetch `GET https://api.resend.com/emails/receiving/{id}?html_format=cid`, using the plain-text `text` field. Confirm event-selected routes against the fetched To recipients.
+5. Extract the message and atomically save a version-2 draft containing immutable destination/mapping snapshots. Only then return `204`.
+6. A background worker delivers each destination independently, using current credentials for the snapshotted connection.
+
+A `204` acknowledges durable intake or an intentionally ignored event, not completed Twenty delivery. Missing plain text or empty extraction is saved as `needs_review`. API or storage failures during intake return `503`; invalid signatures return `401`; invalid events return `400`; bodies over 1 MiB return `413`.
+
+The worker scans on startup and five seconds after each pass. Retry deadlines start at 30 seconds, double, and cap at 30 minutes. They survive restarts and failed destinations retry indefinitely. One failed destination does not discard or repeat successful deliveries to another. Attempts are spaced by two seconds across this single worker; each attempt makes at most two Twenty requests. Run one service instance per persistent volume.
+
+Record IDs derive deterministically from route ID + Resend email ID. The worker checks `GET /rest/{plural}/{id}?depth=0`, creates only after `404`, supplies the same ID in POST, and verifies `data.create{Singular}.id`. A lost POST response or local receipt write is recovered by looking up that ID next time. Existing records are not overwritten. A soft-deleted record whose ID remains reserved may need manual restoration.
+
+All external API requests have a 10-second timeout and a 16 MiB response limit. Metadata refresh has a 45-second overall deadline. No email content or API keys are logged; the admin UI can show subjects to authenticated administrators.
+
+## Persistent data
+
+All state lives under `DATA_DIR`:
+
+```text
+/data/config.db                 SQLite connections, cached schemas, routes
+/data/config.key                Automatically generated credential-encryption key
+/data/<email-hash>.json         Immutable email drafts and destination snapshots
+/data/deliveries/*.json         Independent delivery receipts/retry state
+/data/assignments/*.json        Explicit legacy-draft destination assignments
+```
+
+SQLite uses WAL and FULL synchronous mode. API keys are AES-GCM encrypted in the database with the installation key in `config.key`. The key and database are owner-only files; protection of the complete mounted volume still matters because it contains both. No additional encryption environment variable is needed. An existing database with a missing encryption key fails to open rather than silently replacing the key.
+
+Back up the **whole volume**, including `config.key`. Stop the service before taking a plain filesystem copy so SQLite's database/WAL and file-based drafts are consistent. Losing the key loses access to stored credentials; losing delivery state may cause reprocessing. Keep the volume tied to its original Twenty workspaces. There is no automatic retention policy; manage backups and disk usage. The file store requires hard-link and directory-sync support, as provided by ordinary local Docker volumes.
 
 ## Resend setup
 
-1. Configure inbound email receiving in Resend, including the receiving domain/MX records if using your own domain. Confirm that incoming messages appear in Resend's receiving dashboard.
-2. Create a Resend API key with access to received-email retrieval. Use a **Full access** key if the available restricted key is sending-only. Store it as `RESEND_API_KEY`.
-3. In **Resend → Webhooks**, add an endpoint:
-   - URL: `https://tickets.example.com/webhooks/resend`
-   - Event: `email.received`
-4. Open that webhook's details page and copy its **Signing Secret** (`whsec_...`) into `RESEND_WEBHOOK_SECRET`. This is separate from the API key and is generated by Resend for the webhook endpoint. Create the endpoint first, then configure the secret and deploy the app; replay any delivery that occurred during setup.
-5. Send a real email or forward a message to your receiving address. Verify a successful webhook delivery and an `email saved` application log entry. A synthetic dashboard test may reference an email ID that cannot actually be retrieved; a real received email exercises the full flow.
+Configure email receiving in Resend, including the required receiving domain/MX records. Create an API key with received-email retrieval permissions (use Full access if restricted keys are sending-only).
 
-References: [Receiving email](https://resend.com/docs/dashboard/receiving/introduction), [Retrieving received email](https://resend.com/docs/api-reference/emails/retrieve-received-email), [Webhook signing secret](https://resend.com/docs/webhooks/verify-webhooks-requests).
+In **Resend → Webhooks**, create an endpoint at your public `/webhooks/resend` URL and subscribe to `email.received`. Open the endpoint's details and copy its **Signing Secret** (`whsec_...`) into `RESEND_WEBHOOK_SECRET`. This is separate from your Resend API key. Send a real email to a configured route address to verify the full flow; synthetic test events may reference an email ID that cannot be retrieved.
 
-## Configuration
+References: [Resend retrieval](https://resend.com/docs/api-reference/emails/retrieve-received-email), [Webhook verification](https://resend.com/docs/webhooks/verify-webhooks-requests), [Twenty APIs](https://docs.twenty.com/developers/extend/api).
 
-| Variable | Required | Default / meaning |
-| --- | --- | --- |
-| `RESEND_API_KEY` | Yes | API key allowed to retrieve received emails |
-| `RESEND_WEBHOOK_SECRET` | Yes | Webhook endpoint's `whsec_...` signing secret |
-| `INBOUND_EMAIL_TO` | No | Only accept this To mailbox, e.g. `support@example.com`; empty accepts all |
-| `TWENTY_BASE_URL` | With Twenty key | Instance root, e.g. `https://crm.example.com`, without `/rest` |
-| `TWENTY_API_KEY` | With Twenty URL | Twenty workspace API key |
-| `PORT` | No | `8080` |
-| `DATA_DIR` | No | `./data` natively; `/data` in Docker |
+## Message extraction
 
-Leave both Twenty variables empty for inbox-only operation. **Setting both enables automatic ticket creation for new and already-saved pending drafts on service startup.** Use a Twenty key with read/create access to Tickets and write access to `name` and `issueOrRequest`. The explicit connectivity command below also requires metadata read access.
+The parser keeps the sender's introductory note plus the first forwarded message, or the top message for ordinary emails. It recognizes common English Gmail, Outlook, and Apple Mail separators, wrapped `On … wrote:` boundaries, and `>` quoting. Forwarding headers and older history are removed; signatures inside the selected message are retained.
 
-### Recipient filter
+This is heuristic parsing. Localized markers, inline/bottom-posted replies, and prose resembling mail headers can need adjustments. Original plain text is retained for later reprocessing. HTML-only messages are saved for review by ID/metadata; HTML, raw MIME, and attachments are not downloaded or stored. Markdown-like text may render as formatting in Twenty.
 
-Set this **runtime** variable in Coolify, then redeploy:
+## Local execution and verification
 
-```env
-INBOUND_EMAIL_TO=support@example.com
+Use Go 1.26 or newer. Copy `.env.example` to `.env` and fill in credentials. Compose reads `.env` automatically:
+
+```sh
+docker compose up --build -d
+curl -f http://localhost:8080/healthz
+# Open http://localhost:8080/admin/ locally.
+docker compose logs -f
 ```
 
-The filter matches any address in the outer email's **To** array, case-insensitively. Display names such as `Support <support@example.com>` are supported. Matching uses the complete mailbox; plus tags and aliases are distinct. CC/BCC, the sender, and To headers inside forwarded message text do not count. The filter uses the To data Resend provides, not SMTP envelope-recipient or forwarding-header inference.
-
-Leave the variable empty to accept all recipients. A malformed nonempty setting prevents startup. With filtering enabled, missing or malformed To addresses do not match. Unrelated emails return `204` without saving a draft or creating a ticket; the log records `email ignored` with reason `recipient_mismatch`.
-
-The delivery worker applies the same filter to existing pending drafts. Nonmatching saved drafts remain on disk and become eligible if the setting is changed or cleared. Newly ignored emails are not saved, so replay their Resend webhooks if you later want to process them under a different filter.
-
-## Local execution
-
-Install Go 1.26 or newer. Copy `.env.example` to `.env` and fill in your credentials. The Go binary does not automatically load dotenv files. For native execution, export the variables in your shell (or, for a trusted shell-compatible `.env`, run `set -a; source .env; set +a`).
+For native execution, export the environment variables in your shell first; the binary does not load dotenv files:
 
 ```sh
 go run ./cmd/twenty-tickets
 ```
 
-Or use Docker Compose, which reads `.env` automatically:
-
-```sh
-docker compose up --build -d
-curl -f http://localhost:8080/healthz
-docker compose logs -f
-```
-
-Compose binds to local port 8080. A public HTTPS endpoint or tunnel is needed for Resend to reach a local instance. The named `inbox` volume retains drafts across container recreation. `docker compose down -v` deletes that volume and its drafts.
-
-## Coolify deployment
-
-1. Put this project in a repository accessible to Coolify and create an application using the **Dockerfile** build pack. Select the root `Dockerfile`.
-2. Set the required runtime environment variables. Set `DATA_DIR=/data` and `PORT=8080`; add the optional Twenty pair when available.
-3. Set the application's exposed/container port to **8080** and assign an HTTPS domain. Coolify's proxy terminates TLS; the app listens on HTTP inside the container.
-4. Add **persistent storage mounted at `/data`**. The container runs as UID/GID **10001:10001**. Named Docker volumes inherit the image directory's ownership; for an existing/bind-mounted directory, ensure that UID can write to it.
-5. Use `GET /healthz` on port 8080 for the health check. The image also includes a Docker health check. This is a liveness check; downstream API availability is reported through delivery failures, not this endpoint.
-6. Deploy and configure the Resend webhook URL using your public domain. Allow at least 25 seconds for graceful container shutdown.
-
-Run one instance/worker per persistent volume. Delivery-state updates assume a single worker. Twenty's stable ticket IDs provide additional protection against duplicate creation during overlapping deliveries.
-
-## Saved drafts
-
-Each email is stored as `/data/<sha256-of-resend-email-id>.json` (or under your configured `DATA_DIR`). Writes are atomic and deduplicated by received email ID, including concurrent deliveries. Storage must support hard links and directory syncing; ordinary local Docker volumes do. Preserve the volume to retain deduplication across deploys.
-
-Records contain:
-
-- `version`, webhook `event_id`, `saved_at`;
-- `status`: `pending_twenty` or `needs_review`;
-- `review_reason` when the plain-text body is missing or extraction is empty;
-- `email`: Resend ID, original plain text, outer sender/recipients, subject, message ID and creation time;
-- `body`: extracted ticket text;
-- `forwarded`: whether the parser recognized a forwarded section.
-
-Original plain text is retained so extraction can be revised later. Files contain email content and addresses; application logs contain only IDs, status and body size. The inbox has no automatic retention policy or public read endpoint. Back it up and manage its disk usage. For HTML-only emails, the review record retains the email ID and metadata, but does not download/store HTML, raw MIME, or attachments; inspect the original in Resend.
-
-A `204` means the draft was saved (or was already present), **not that a Twenty ticket exists yet**. The worker sends `pending_twenty` drafts; `needs_review` drafts are skipped. Original drafts remain immutable, so their `status` describes intake eligibility rather than final delivery status.
-
-Delivery state lives in `/data/deliveries/<same-hash>.json`, with `status` (`retry` or `delivered`), `email_id`, `ticket_id` on success, attempt count, update time, and the next retry deadline/last error on failure. Look for a **`Twenty ticket delivered`** log entry or a `delivered` receipt to confirm success.
-
-Retries start after 30 seconds, double after each failure, and cap at 30 minutes. Retry deadlines survive restarts. Failed drafts stay on disk and are retried indefinitely; fix credentials, permissions, or required-field/default configuration if errors persist. Attempts are spaced by at least two seconds within a worker to keep its maximum two API calls per ticket below Twenty's documented 100 requests/minute limit. Other integrations share the workspace's quota.
-
-The service derives a deterministic UUID from the Resend email ID, looks up `GET /rest/tickets/{id}?depth=0`, and creates only after a `404`. Creation sends that same `id`; Twenty rejects duplicate primary keys. If a POST succeeds but its response or the local receipt write is lost, the next attempt finds the existing ticket. Existing tickets are not overwritten during recovery. A soft-deleted ticket may require manual review/restoration if its ID remains reserved. Keep each data volume associated with the same Twenty workspace, including when rotating API keys.
-
-Deleting a draft removes its webhook deduplication record. Preserve both drafts and delivery receipts across deploys; receipt retention also prevents recreating tickets that were subsequently deleted in Twenty.
-
-## Message extraction
-
-- Ordinary emails: retain the top message before quoted history.
-- Forwarded emails: retain the introductory note **plus the first forwarded message**, dropping forwarding headers and older replies/forwards.
-- Recognizes common English Gmail `Forwarded message`, Apple Mail `Begin forwarded message:`, Outlook `Original Message`/header blocks, `On … wrote:` (including wrapped lines), and `>` quoting.
-- Outlook uses similar header blocks for replies and forwards, so `Fw:`/`Fwd:` in the outer subject determines whether to retain the first block.
-- Preserves signatures within the selected message and collapses excess blank lines.
-
-This is deterministic heuristic parsing. Localized client markers, inline/bottom-posted replies, unusual indentation, and prose resembling mail headers may need adjustments. It stops at the first recognized history boundary, so inline answers after that boundary are omitted. Share a few redacted real emails when available to tune the fixtures. An AI parsing step is not required for this initial flow.
-
-## Twenty ticket mapping
-
-Create a key in **Twenty → Settings → API & Webhooks**, and set the URL/key pair. Your workspace-specific API documentation is available there too; Twenty generates endpoints from your object schema.
-
-Run a read-only authentication/connectivity check:
-
-```sh
-go run ./cmd/twenty-tickets check-twenty
-# Or, for a running Compose deployment:
-docker compose exec twenty-tickets twenty-tickets check-twenty
-```
-
-This requests `GET /rest/metadata/objects`, reporting success without logging your schema or starting the delivery worker. A `403` can indicate the API key's role lacks metadata access. This checks connectivity, not ticket creation permissions; verify those with a real received email after deployment.
-
-Tickets are created using `POST /rest/tickets?depth=0` with this payload shape:
-
-```json
-{
-  "id": "<stable UUID derived from the Resend email ID>",
-  "name": "Email subject",
-  "issueOrRequest": {
-    "markdown": "Introductory note\n\nFirst forwarded message"
-  }
-}
-```
-
-- **Name:** outer email subject, falling back to `(No subject)` if blank.
-- **Issue or Request:** extracted body in `issueOrRequest.markdown`. Twenty converts Markdown into its rich-text representation. Markdown-like syntax in the email may render as formatting.
-- **Attribution:** Twenty records creation by the API token. The service does not send or require a `generated` field.
-- **Status and Type:** omitted so Twenty applies its configured defaults (`status` / `typeCustom`). Example values `OPEN` and `BUG` in the API response are not forced by this service.
-- **Resolution, App relationship, actors, timestamps and other fields:** omitted; system values/defaults are managed by Twenty.
-
-The create response is read from `data.createTicket.id` and checked against the submitted ID. `depth=0` avoids fetching large nested relationships. Source email metadata remains in the local draft; no additional custom fields are required for deduplication.
-
-Reference: [Twenty APIs](https://docs.twenty.com/developers/extend/api).
-
-## Verification
+The named Compose `inbox` volume survives container replacement. `docker compose down -v` deletes it. A public HTTPS endpoint/tunnel is required for Resend to reach a local instance.
 
 ```sh
 go test -race ./...
@@ -164,4 +197,4 @@ go vet ./...
 docker build -t twenty-tickets .
 ```
 
-Tests cover real HMAC-signed webhook requests through ticket creation against mock APIs, recipient matching and filtering of new/saved emails, omission of the removed `generated` field, rich-text mapping, preservation of Twenty defaults, lost creation responses, concurrent duplicate creation, persisted retry deadlines, failed receipt writes, review-record skipping, parser fixtures, and bounded API responses. Live Resend and Twenty credentials are needed for end-to-end deployment verification.
+Tests exercise authenticated admin forms, CSRF protection, schema rendering, metadata pagination/envelopes, encrypted credential persistence, typed mappings, recipient routing, signed webhooks, independent retries, lost responses, failed receipt writes, legacy assignment, parser fixtures, and duplicate handling. Live instance credentials are needed to confirm workspace-specific permissions and schema behavior.

@@ -17,7 +17,7 @@ func NewRecipientFilter(value string) (RecipientFilter, error) {
 	}
 	address, err := mail.ParseAddress(value)
 	if err != nil {
-		return RecipientFilter{}, fmt.Errorf("INBOUND_EMAIL_TO must be a single valid email address")
+		return RecipientFilter{}, fmt.Errorf("recipient must be a single valid email address")
 	}
 	return RecipientFilter{address: address.Address}, nil
 }

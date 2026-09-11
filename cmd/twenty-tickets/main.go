@@ -11,11 +11,11 @@ import (
 	"syscall"
 	"time"
 
+	"twenty-tickets/internal/admin"
+	"twenty-tickets/internal/config"
 	"twenty-tickets/internal/delivery"
 	"twenty-tickets/internal/inbox"
-	"twenty-tickets/internal/message"
 	"twenty-tickets/internal/resend"
-	"twenty-tickets/internal/twenty"
 	"twenty-tickets/internal/webhook"
 )
 
@@ -40,33 +40,11 @@ func run(log *slog.Logger) error {
 		}
 		return nil
 	}
-	var twentyClient *twenty.Client
-	if os.Getenv("TWENTY_BASE_URL") != "" || os.Getenv("TWENTY_API_KEY") != "" {
-		var err error
-		twentyClient, err = twenty.New(os.Getenv("TWENTY_BASE_URL"), os.Getenv("TWENTY_API_KEY"))
-		if err != nil {
-			return fmt.Errorf("Twenty configuration: %w", err)
-		}
-	}
 	if len(os.Args) > 1 {
-		if os.Args[1] != "check-twenty" {
-			return fmt.Errorf("unknown command: %s", os.Args[1])
-		}
-		if twentyClient == nil {
-			return fmt.Errorf("set TWENTY_BASE_URL and TWENTY_API_KEY")
-		}
-		if _, err := twentyClient.Metadata(context.Background()); err != nil {
-			return err
-		}
-		log.Info("Twenty metadata API connection successful")
-		return nil
+		return fmt.Errorf("unknown command: %s; manage connections at /admin/", os.Args[1])
 	}
 	if os.Getenv("RESEND_WEBHOOK_SECRET") == "" {
 		return fmt.Errorf("RESEND_WEBHOOK_SECRET is required")
-	}
-	recipient, err := message.NewRecipientFilter(os.Getenv("INBOUND_EMAIL_TO"))
-	if err != nil {
-		return err
 	}
 	receiver, err := resend.New(os.Getenv("RESEND_API_KEY"))
 	if err != nil {
@@ -76,29 +54,33 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("inbox initialization: %w", err)
 	}
-	handler, err := webhook.New(os.Getenv("RESEND_WEBHOOK_SECRET"), receiver, store, log, recipient)
+	settings, err := config.Open(env("DATA_DIR", "./data"))
+	if err != nil {
+		return fmt.Errorf("configuration storage: %w", err)
+	}
+	defer settings.Close()
+	adminHandler, err := admin.New(settings, store, os.Getenv("ADMIN_USERNAME"), os.Getenv("ADMIN_PASSWORD"))
+	if err != nil {
+		return err
+	}
+	handler, err := webhook.New(os.Getenv("RESEND_WEBHOOK_SECRET"), receiver, store, log, settings)
 	if err != nil {
 		return fmt.Errorf("webhook configuration: %w", err)
 	}
-	server := &http.Server{Addr: ":" + env("PORT", "8080"), Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 20 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+	mux := http.NewServeMux()
+	mux.Handle("/admin/", adminHandler)
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/admin/", http.StatusSeeOther) })
+	mux.Handle("/", handler)
+	server := &http.Server{Addr: ":" + env("PORT", "8080"), Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	workerCtx, cancelWorker := context.WithCancel(ctx)
 	workerDone := make(chan struct{})
-	mode := "inbox_only"
-	if twentyClient != nil {
-		mode = "twenty_tickets"
-		go func() {
-			defer close(workerDone)
-			delivery.New(store, twentyClient, log, recipient).Run(workerCtx)
-		}()
-	} else {
-		close(workerDone)
-	}
+	go func() { defer close(workerDone); delivery.New(store, settings, log).Run(workerCtx) }()
 	defer func() { cancelWorker(); <-workerDone }()
 	result := make(chan error, 1)
 	go func() { result <- server.ListenAndServe() }()
-	log.Info("webhook service started", "address", server.Addr, "mode", mode, "twenty_configured", twentyClient != nil)
+	log.Info("webhook service started", "address", server.Addr, "mode", "admin_routing")
 	select {
 	case err := <-result:
 		return err

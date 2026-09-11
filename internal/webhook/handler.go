@@ -14,6 +14,7 @@ import (
 	"twenty-tickets/internal/inbox"
 	"twenty-tickets/internal/message"
 	"twenty-tickets/internal/resend"
+	"twenty-tickets/internal/routing"
 )
 
 type Receiver interface {
@@ -24,7 +25,11 @@ type Store interface {
 	Save(inbox.Draft) error
 }
 
-func New(secret string, receiver Receiver, store Store, log *slog.Logger, recipient message.RecipientFilter) (http.Handler, error) {
+type Router interface {
+	Match([]string) ([]routing.Destination, error)
+}
+
+func New(secret string, receiver Receiver, store Store, log *slog.Logger, router Router) (http.Handler, error) {
 	verifier, err := svix.NewWebhook(secret)
 	if err != nil {
 		return nil, err
@@ -71,12 +76,6 @@ func New(secret string, receiver Receiver, store Store, log *slog.Logger, recipi
 			log.Info("email ignored", "email_id", id, "reason", "recipient_mismatch")
 			w.WriteHeader(http.StatusNoContent)
 		}
-		// Use verified webhook recipients to avoid fetching unrelated emails.
-		// If absent, fall back to the received-email API response below.
-		if len(event.Data.To) > 0 && !recipient.Matches(event.Data.To) {
-			ignore()
-			return
-		}
 		fail := func(stage string, err error) {
 			log.Error("email processing failed", "email_id", id, "stage", stage, "error", err)
 			http.Error(w, "processing failed; retry later", http.StatusServiceUnavailable)
@@ -90,16 +89,47 @@ func New(secret string, receiver Receiver, store Store, log *slog.Logger, recipi
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		// Route once from verified event recipients when present, then confirm
+		// against the fetched To array. Configuration changes cannot retarget it.
+		var destinations []routing.Destination
+		if len(event.Data.To) > 0 {
+			destinations, err = router.Match(event.Data.To)
+			if err != nil {
+				fail("routing", err)
+				return
+			}
+			if len(destinations) == 0 {
+				ignore()
+				return
+			}
+		}
 		email, err := receiver.Receive(r.Context(), id)
 		if err != nil {
 			fail("resend_fetch", err)
 			return
 		}
-		if !recipient.Matches(email.To) {
+		if len(event.Data.To) == 0 {
+			destinations, err = router.Match(email.To)
+			if err != nil {
+				fail("routing", err)
+				return
+			}
+		} else {
+			// Each snapshot includes its matched inbound mailbox.
+			matched := destinations[:0]
+			for _, destination := range destinations {
+				filter, _ := message.NewRecipientFilter(destination.Inbound)
+				if filter.Matches(email.To) {
+					matched = append(matched, destination)
+				}
+			}
+			destinations = matched
+		}
+		if len(destinations) == 0 {
 			ignore()
 			return
 		}
-		draft := inbox.Draft{Version: 1, EventID: r.Header.Get("svix-id"), SavedAt: time.Now().UTC(), Status: "pending_twenty", Email: email}
+		draft := inbox.Draft{Version: 2, EventID: r.Header.Get("svix-id"), SavedAt: time.Now().UTC(), Status: "pending_twenty", Email: email, Destinations: destinations}
 		if email.Text == nil || strings.TrimSpace(*email.Text) == "" {
 			draft.Status, draft.ReviewReason = "needs_review", "missing_plain_text"
 		} else {

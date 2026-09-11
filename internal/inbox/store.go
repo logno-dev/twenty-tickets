@@ -13,17 +13,19 @@ import (
 	"time"
 
 	"twenty-tickets/internal/resend"
+	"twenty-tickets/internal/routing"
 )
 
 type Draft struct {
-	Version      int          `json:"version"`
-	EventID      string       `json:"event_id"`
-	SavedAt      time.Time    `json:"saved_at"`
-	Status       string       `json:"status"`
-	ReviewReason string       `json:"review_reason,omitempty"`
-	Email        resend.Email `json:"email"`
-	Body         string       `json:"body"`
-	Forwarded    bool         `json:"forwarded"`
+	Version      int                   `json:"version"`
+	EventID      string                `json:"event_id"`
+	SavedAt      time.Time             `json:"saved_at"`
+	Status       string                `json:"status"`
+	ReviewReason string                `json:"review_reason,omitempty"`
+	Email        resend.Email          `json:"email"`
+	Body         string                `json:"body"`
+	Forwarded    bool                  `json:"forwarded"`
+	Destinations []routing.Destination `json:"destinations,omitempty"`
 }
 
 type Store struct{ dir string }
@@ -42,6 +44,9 @@ func New(dir string) (*Store, error) {
 		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Join(dir, "deliveries"), 0700); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "assignments"), 0700); err != nil {
 		return nil, err
 	}
 	if err := syncDir(dir); err != nil {
@@ -72,6 +77,7 @@ func (s *Store) Save(d Draft) error {
 // worker owns these records; webhook handlers only create original drafts.
 type Delivery struct {
 	EmailID       string    `json:"email_id"`
+	RouteID       string    `json:"route_id,omitempty"`
 	TicketID      string    `json:"ticket_id,omitempty"`
 	Status        string    `json:"status"`
 	Attempts      int       `json:"attempts"`
@@ -85,10 +91,18 @@ func (s *Store) deliveryPath(id string) string {
 }
 
 func (s *Store) LoadDelivery(id string) (Delivery, error) {
+	return s.LoadDestinationDelivery(id, "")
+}
+
+func (s *Store) LoadDestinationDelivery(id, routeID string) (Delivery, error) {
 	var d Delivery
-	b, err := os.ReadFile(s.deliveryPath(id))
+	key := id
+	if routeID != "" {
+		key += "@route:" + routeID
+	}
+	b, err := os.ReadFile(s.deliveryPath(key))
 	if os.IsNotExist(err) {
-		return Delivery{EmailID: id}, nil
+		return Delivery{EmailID: id, RouteID: routeID}, nil
 	}
 	if err != nil {
 		return d, err
@@ -96,14 +110,78 @@ func (s *Store) LoadDelivery(id string) (Delivery, error) {
 	if err := json.Unmarshal(b, &d); err != nil {
 		return d, err
 	}
-	if d.EmailID != id || (d.Status != "delivered" && d.Status != "retry") || d.Attempts < 0 || (d.Status == "delivered" && d.TicketID == "") {
+	if d.EmailID != id || d.RouteID != routeID || (d.Status != "delivered" && d.Status != "retry") || d.Attempts < 0 || (d.Status == "delivered" && d.TicketID == "") {
 		return d, fmt.Errorf("invalid delivery state for email %s", id)
 	}
 	return d, nil
 }
 
 func (s *Store) SaveDelivery(d Delivery) error {
-	return writeJSON(s.deliveryPath(d.EmailID), d, true)
+	key := d.EmailID
+	if d.RouteID != "" {
+		key += "@route:" + d.RouteID
+	}
+	return writeJSON(s.deliveryPath(key), d, true)
+}
+
+func (s *Store) Draft(id string) (Draft, error) {
+	var d Draft
+	b, err := os.ReadFile(s.path(id))
+	if err != nil {
+		return d, err
+	}
+	err = json.Unmarshal(b, &d)
+	if err == nil && d.Email.ID != id {
+		err = fmt.Errorf("invalid draft identity")
+	}
+	return d, err
+}
+func (s *Store) Destinations(d Draft) ([]routing.Destination, error) {
+	if d.Version == 2 {
+		return d.Destinations, nil
+	}
+	legacy, err := s.LoadDelivery(d.Email.ID)
+	if err != nil {
+		return nil, err
+	}
+	if legacy.Status == "delivered" {
+		return nil, nil
+	}
+	b, err := os.ReadFile(filepath.Join(s.dir, "assignments", filepath.Base(s.path(d.Email.ID))))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var destinations []routing.Destination
+	err = json.Unmarshal(b, &destinations)
+	return destinations, err
+}
+func (s *Store) AssignLegacy(id string, destination routing.Destination) error {
+	d, err := s.Draft(id)
+	if err != nil {
+		return err
+	}
+	if d.Version != 1 || d.Status != "pending_twenty" {
+		return fmt.Errorf("only legacy pending drafts can be assigned")
+	}
+	state, err := s.LoadDelivery(id)
+	if err != nil {
+		return err
+	}
+	if state.Status == "delivered" {
+		return fmt.Errorf("legacy draft was already delivered")
+	}
+	old, err := s.Destinations(d)
+	if err != nil {
+		return err
+	}
+	if len(old) > 0 {
+		return fmt.Errorf("draft already has a destination")
+	}
+	destination.Legacy = true
+	return writeJSON(filepath.Join(s.dir, "assignments", filepath.Base(s.path(id))), []routing.Destination{destination}, false)
 }
 
 // EachDraft reads one draft at a time. Bad files are reported but do not prevent
@@ -126,7 +204,7 @@ func (s *Store) EachDraft(ctx context.Context, visit func(Draft) error) error {
 		if err == nil {
 			err = json.Unmarshal(b, &d)
 		}
-		if err == nil && (d.Version != 1 || !resend.ValidID(d.Email.ID) || filepath.Base(s.path(d.Email.ID)) != entry.Name()) {
+		if err == nil && ((d.Version != 1 && d.Version != 2) || !resend.ValidID(d.Email.ID) || filepath.Base(s.path(d.Email.ID)) != entry.Name()) {
 			err = fmt.Errorf("invalid draft identity or version")
 		}
 		if err == nil {

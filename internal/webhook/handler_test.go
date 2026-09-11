@@ -22,6 +22,7 @@ import (
 	"twenty-tickets/internal/inbox"
 	"twenty-tickets/internal/message"
 	"twenty-tickets/internal/resend"
+	"twenty-tickets/internal/routing"
 	"twenty-tickets/internal/twenty"
 )
 
@@ -62,7 +63,7 @@ func TestWebhookPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), receiver, store, slog.New(slog.NewTextHandler(io.Discard, nil)), message.RecipientFilter{})
+	handler, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), receiver, store, slog.New(slog.NewTextHandler(io.Discard, nil)), testRouter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,17 +165,17 @@ func TestWebhookPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worker := delivery.New(reopened, client, slog.New(slog.NewTextHandler(io.Discard, nil)), message.RecipientFilter{})
+	worker := delivery.New(reopened, testConnections{client}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	for range 2 {
 		if err := worker.Process(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 	}
-	receipt, err := reopened.LoadDelivery("email_123")
+	receipt, err := reopened.LoadDestinationDelivery("email_123", "test-route")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if creates.Load() != 1 || receipt.Status != "delivered" || receipt.TicketID != twenty.TicketID("email_123") {
+	if creates.Load() != 1 || receipt.Status != "delivered" || receipt.TicketID != (routing.Destination{RouteID: "test-route"}).RecordID("email_123") {
 		t.Fatalf("bad ticket delivery: %+v, creates=%d", receipt, creates.Load())
 	}
 }
@@ -197,7 +198,7 @@ func TestReviewAndStorageFailure(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), fakeReceiver{text}, store, slog.Default(), message.RecipientFilter{})
+		h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), fakeReceiver{text}, store, slog.Default(), testRouter{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -222,7 +223,7 @@ func TestReviewAndStorageFailure(t *testing.T) {
 			t.Fatalf("missing review flag: %+v", d)
 		}
 	}
-	h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), fakeReceiver{ptr("hello")}, brokenStore{}, slog.Default(), message.RecipientFilter{})
+	h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), fakeReceiver{ptr("hello")}, brokenStore{}, slog.Default(), testRouter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +272,7 @@ func TestRecipientFiltering(t *testing.T) {
 				fetches++
 				return resend.Email{ID: id, To: tt.fetchedTo, CC: []string{"support@example.com"}, From: "support@example.com", Text: ptr("Newest message\nTo: support@example.com")}, nil
 			})
-			h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), receiver, store, slog.New(slog.NewTextHandler(io.Discard, nil)), filter)
+			h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), receiver, store, slog.New(slog.NewTextHandler(io.Discard, nil)), testRouter{filter: filter, inbound: "support@example.com"})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -293,5 +294,60 @@ func TestRecipientFiltering(t *testing.T) {
 				t.Fatalf("saved=%v; want %v, error=%v", exists, tt.wantSaved, err)
 			}
 		})
+	}
+}
+
+type testRouter struct {
+	filter  message.RecipientFilter
+	inbound string
+}
+
+func (r testRouter) Match(to []string) ([]routing.Destination, error) {
+	if !r.filter.Matches(to) {
+		return nil, nil
+	}
+	return []routing.Destination{{RouteID: "test-route", ConnectionID: "test-connection", Inbound: r.inbound, Singular: "ticket", Plural: "tickets", Mappings: []routing.Mapping{{Field: "name", Type: "TEXT", Source: "subject"}, {Field: "issueOrRequest", Type: "RICH_TEXT", Source: "body"}}}}, nil
+}
+
+type testConnections struct{ client *twenty.Client }
+
+func (c testConnections) Client(string) (*twenty.Client, error) { return c.client, nil }
+
+type routerFunc func([]string) ([]routing.Destination, error)
+
+func (f routerFunc) Match(to []string) ([]routing.Destination, error) { return f(to) }
+func TestRoutingSnapshotAndSetupFailure(t *testing.T) {
+	for _, setup := range []bool{false, true} {
+		store, err := inbox.New(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		fetches := 0
+		receiver := receiverFunc(func(_ context.Context, id string) (resend.Email, error) {
+			fetches++
+			return resend.Email{ID: id, To: []string{"a@example.com", "b@example.com"}, Text: ptr("Body")}, nil
+		})
+		router := routerFunc(func(to []string) ([]routing.Destination, error) {
+			if !setup {
+				return nil, fmt.Errorf("no routes")
+			}
+			return []routing.Destination{{RouteID: "a", Inbound: "a@example.com"}, {RouteID: "b", Inbound: "b@example.com"}}, nil
+		})
+		h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), receiver, store, slog.New(slog.NewTextHandler(io.Discard, nil)), router)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, signedRequest(`{"type":"email.received","data":{"email_id":"multi","to":["a@example.com","b@example.com"]}}`, time.Now()))
+		if !setup {
+			if w.Code != 503 || fetches != 0 {
+				t.Fatal("unconfigured event acknowledged or fetched")
+			}
+			continue
+		}
+		d, err := store.Draft("multi")
+		if err != nil || w.Code != 204 || fetches != 1 || len(d.Destinations) != 2 || d.Version != 2 {
+			t.Fatalf("bad routed intake: %+v %v, status=%d fetches=%d", d, err, w.Code, fetches)
+		}
 	}
 }

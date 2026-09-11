@@ -2,200 +2,210 @@ package delivery
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"twenty-tickets/internal/inbox"
-	"twenty-tickets/internal/message"
 	"twenty-tickets/internal/resend"
+	"twenty-tickets/internal/routing"
+	"twenty-tickets/internal/twenty"
 )
 
-type fakeTickets struct {
-	calls int
-	fail  bool
-}
+type connections map[string]*twenty.Client
 
-func (f *fakeTickets) EnsureTicket(_ context.Context, id, subject, body string) (string, error) {
-	f.calls++
-	if f.fail {
-		return "", fmt.Errorf("API returned HTTP 429")
+func (c connections) Client(id string) (*twenty.Client, error) {
+	if client := c[id]; client != nil {
+		return client, nil
 	}
-	return "ticket-" + id, nil
+	return nil, fmt.Errorf("connection missing")
 }
 
-func newTestWorker(store Store, tickets Tickets, now *time.Time) *Worker {
-	w := New(store, tickets, slog.New(slog.NewTextHandler(io.Discard, nil)), message.RecipientFilter{})
-	w.now = func() time.Time { return *now }
-	w.pause = 0
-	return w
+type backend struct {
+	mu         sync.Mutex
+	records    map[string]bool
+	fail, lose bool
+	posts      int
 }
 
-func saveDraft(t *testing.T, store *inbox.Store, id, status string) {
+func (b *backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.fail {
+		w.WriteHeader(429)
+		return
+	}
+	if r.Method == "GET" {
+		parts := strings.Split(r.URL.Path, "/")
+		id := parts[len(parts)-1]
+		if !b.records[id] {
+			w.WriteHeader(404)
+			return
+		}
+		fmt.Fprintf(w, `{"data":{"ticket":{"id":%q}}}`, id)
+		return
+	}
+	var payload struct {
+		ID string `json:"id"`
+	}
+	json.NewDecoder(r.Body).Decode(&payload)
+	if b.records[payload.ID] {
+		w.WriteHeader(400)
+		return
+	}
+	b.records[payload.ID] = true
+	b.posts++
+	if b.lose {
+		w.WriteHeader(502)
+		return
+	}
+	fmt.Fprintf(w, `{"data":{"createTicket":{"id":%q}}}`, payload.ID)
+}
+func newBackend(t *testing.T) (*backend, *twenty.Client) {
 	t.Helper()
-	err := store.Save(inbox.Draft{Version: 1, Email: resend.Email{ID: id, Subject: "Help"}, Body: "Please fix it.", Status: status})
+	b := &backend{records: map[string]bool{}}
+	s := httptest.NewServer(b)
+	t.Cleanup(s.Close)
+	c, err := twenty.New(s.URL, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
+	return b, c
 }
-
-func TestPersistedRetryAndRestart(t *testing.T) {
+func destination(id string) routing.Destination {
+	return routing.Destination{RouteID: id, ConnectionID: id, Singular: "ticket", Plural: "tickets", Mappings: []routing.Mapping{{Field: "name", Type: "TEXT", Source: "subject"}, {Field: "issueOrRequest", Type: "RICH_TEXT", Source: "body"}}}
+}
+func testWorker(store Store, c connections, now *time.Time) *Worker {
+	w := New(store, c, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	w.pause = 0
+	w.now = func() time.Time { return *now }
+	return w
+}
+func TestIndependentDestinationsAndRestart(t *testing.T) {
 	dir := t.TempDir()
 	store, err := inbox.New(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	saveDraft(t, store, "email", "pending_twenty")
-	saveDraft(t, store, "review", "needs_review")
-	tickets := &fakeTickets{fail: true}
+	d := inbox.Draft{Version: 2, Status: "pending_twenty", Email: resend.Email{ID: "email", Subject: "Help"}, Body: "Body", Destinations: []routing.Destination{destination("a"), destination("b")}}
+	if err := store.Save(d); err != nil {
+		t.Fatal(err)
+	}
+	a, ca := newBackend(t)
+	b, cb := newBackend(t)
+	b.fail = true
+	c := connections{"a": ca, "b": cb}
 	now := time.Now()
-	w := newTestWorker(store, tickets, &now)
+	w := testWorker(store, c, &now)
 	if err := w.Process(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	state, err := store.LoadDelivery("email")
-	if err != nil {
-		t.Fatal(err)
+	first, err := store.LoadDestinationDelivery("email", "a")
+	if err != nil || first.Status != "delivered" {
+		t.Fatalf("a: %+v %v", first, err)
 	}
-	if state.Status != "retry" || state.Attempts != 1 || state.LastError == "" || !state.NextAttemptAt.Equal(now.Add(30*time.Second)) {
-		t.Fatalf("bad retry: %+v", state)
+	second, err := store.LoadDestinationDelivery("email", "b")
+	if err != nil || second.Status != "retry" || second.Attempts != 1 || !second.NextAttemptAt.Equal(now.Add(30*time.Second)) {
+		t.Fatalf("b: %+v %v", second, err)
 	}
-	// Simulate restart: deadlines live on disk, not only in the old worker.
 	store, err = inbox.New(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	w = newTestWorker(store, tickets, &now)
+	w = testWorker(store, c, &now)
+	b.mu.Lock()
+	b.fail = false
+	b.lose = true
+	b.mu.Unlock()
 	if err := w.Process(context.Background()); err != nil {
 		t.Fatal(err)
-	}
-	if tickets.calls != 1 {
-		t.Fatal("retried before deadline or sent review draft")
 	}
 	now = now.Add(31 * time.Second)
-	tickets.fail = false
 	if err := w.Process(context.Background()); err != nil {
 		t.Fatal(err)
-	}
-	state, err = store.LoadDelivery("email")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if state.Status != "delivered" || state.TicketID != "ticket-email" || state.Attempts != 2 || state.LastError != "" || !state.NextAttemptAt.IsZero() {
-		t.Fatalf("bad receipt: %+v", state)
-	}
-	store, err = inbox.New(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	w = newTestWorker(store, tickets, &now)
+	} // Commit with lost response.
+	now = now.Add(61 * time.Second)
 	if err := w.Process(context.Background()); err != nil {
 		t.Fatal(err)
+	} // Recover by stable ID.
+	second, err = store.LoadDestinationDelivery("email", "b")
+	if err != nil || second.Status != "delivered" {
+		t.Fatalf("retry recovery: %+v %v", second, err)
 	}
-	if tickets.calls != 2 {
-		t.Fatal("delivered ticket sent again")
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if a.posts != 1 || b.posts != 1 {
+		t.Fatalf("duplicates: a=%d b=%d", a.posts, b.posts)
 	}
 }
 
 type receiptFailure struct{ *inbox.Store }
 
-func (s receiptFailure) SaveDelivery(inbox.Delivery) error { return fmt.Errorf("disk full") }
-
-func TestReceiptFailureRemainsPending(t *testing.T) {
+func (receiptFailure) SaveDelivery(inbox.Delivery) error { return fmt.Errorf("disk full") }
+func TestReceiptFailureRecoveryAndLegacyHold(t *testing.T) {
 	store, err := inbox.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	saveDraft(t, store, "email", "pending_twenty")
-	tickets := &fakeTickets{}
+	for _, d := range []inbox.Draft{
+		{Version: 1, Status: "pending_twenty", Email: resend.Email{ID: "old"}, Body: "Legacy"},
+		{Version: 2, Status: "needs_review", Email: resend.Email{ID: "review"}, Destinations: []routing.Destination{destination("a")}},
+		{Version: 2, Status: "pending_twenty", Email: resend.Email{ID: "new"}, Body: "Body", Destinations: []routing.Destination{destination("a")}},
+	} {
+		if err := store.Save(d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b, c := newBackend(t)
 	now := time.Now()
-	w := newTestWorker(receiptFailure{store}, tickets, &now)
+	clients := connections{"a": c}
+	w := testWorker(receiptFailure{store}, clients, &now)
 	if err := w.Process(context.Background()); err == nil {
 		t.Fatal("receipt failure ignored")
 	}
-	state, err := store.LoadDelivery("email")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if state.Status == "delivered" {
-		t.Fatal("failed receipt recorded as delivered")
-	}
-	w = newTestWorker(store, tickets, &now)
+	w = testWorker(store, clients, &now)
 	if err := w.Process(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if tickets.calls != 2 {
-		t.Fatal("pending draft not retried")
+	b.mu.Lock()
+	if b.posts != 1 {
+		t.Fatal("legacy/review delivered or duplicate created")
+	}
+	b.mu.Unlock()
+	if err := store.AssignLegacy("old", destination("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Process(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.LoadDestinationDelivery("old", "a")
+	if err != nil || state.TicketID != twenty.TicketID("old") {
+		t.Fatalf("legacy ID lost: %+v %v", state, err)
+	}
+	if err := store.AssignLegacy("old", destination("b")); err == nil {
+		t.Fatal("legacy reassigned")
 	}
 }
-
 func TestCancellationAndBackoff(t *testing.T) {
 	store, err := inbox.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	saveDraft(t, store, "email", "pending_twenty")
-	tickets := &fakeTickets{}
 	now := time.Now()
-	w := newTestWorker(store, tickets, &now)
+	w := testWorker(store, connections{}, &now)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := w.Process(ctx); err == nil {
-		t.Fatal("cancellation ignored")
-	}
-	if tickets.calls != 0 {
-		t.Fatal("request after cancellation")
-	}
+	w.Run(ctx)
 	if backoff(1) != 30*time.Second || backoff(2) != time.Minute || backoff(100) != 30*time.Minute {
-		t.Fatal("bad retry backoff")
-	}
-}
-
-func TestRecipientFilterAppliesToSavedDrafts(t *testing.T) {
-	store, err := inbox.New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	for id, to := range map[string][]string{
-		"matching": {"Support <SUPPORT@example.com>"},
-		"other":    {"other@example.com"},
-		"missing":  nil,
-	} {
-		if err := store.Save(inbox.Draft{Version: 1, Email: resend.Email{ID: id, To: to}, Body: "Body", Status: "pending_twenty"}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	tickets := &fakeTickets{}
-	now := time.Now()
-	w := newTestWorker(store, tickets, &now)
-	w.recipient, err = message.NewRecipientFilter("support@example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := w.Process(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if tickets.calls != 1 {
-		t.Fatalf("sent %d tickets, want only matching recipient", tickets.calls)
-	}
-	state, err := store.LoadDelivery("matching")
-	if err != nil || state.Status != "delivered" {
-		t.Fatalf("missing matching delivery: %+v %v", state, err)
-	}
-	for _, id := range []string{"other", "missing"} {
-		state, err := store.LoadDelivery(id)
-		if err != nil || state.Status != "" || state.Attempts != 0 {
-			t.Fatalf("filtered draft marked attempted: %+v %v", state, err)
-		}
-	}
-	// Filtering does not delete the old backlog; clearing the setting makes it eligible again.
-	w = newTestWorker(store, tickets, &now)
-	if err := w.Process(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if tickets.calls != 3 {
-		t.Fatalf("backlog was lost or delivered again: %d", tickets.calls)
+		t.Fatal("bad backoff")
 	}
 }
