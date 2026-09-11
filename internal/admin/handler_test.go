@@ -12,6 +12,8 @@ import (
 	"twenty-tickets/internal/activity"
 	"twenty-tickets/internal/config"
 	"twenty-tickets/internal/inbox"
+	"twenty-tickets/internal/routing"
+	"twenty-tickets/internal/twenty"
 )
 
 func TestAdminFlowAuthenticationCSRFAndSchemaForm(t *testing.T) {
@@ -80,12 +82,12 @@ func TestAdminFlowAuthenticationCSRFAndSchemaForm(t *testing.T) {
 		t.Fatal("saved API key exposed")
 	}
 	w = request("GET", "/admin/route?connection="+id+"&object=obj", nil, true)
-	for _, want := range []string{`value="subject" selected`, `value="body" selected`, `value="OPEN"`, `name="source_f-status"`} {
+	for _, want := range []string{`value="cleaned_subject" selected`, `>Cleaned subject</option>`, `>Raw subject</option>`, `value="cleaned_body" selected`, `>Cleaned body</option>`, `>Raw body</option>`, `value="OPEN"`, `name="source_f-status"`} {
 		if !strings.Contains(w.Body.String(), want) {
 			t.Fatalf("schema-aware form missing %s: %s", want, w.Body.String())
 		}
 	}
-	w = request("POST", "/admin/route", url.Values{"csrf": {token[1]}, "name": {"Support"}, "connection": {id}, "object": {"obj"}, "inbound": {"support@example.com"}, "enabled": {"on"}, "source_f-name": {"subject"}, "source_f-body": {"body"}, "source_f-status": {"default"}}, true)
+	w = request("POST", "/admin/route", url.Values{"csrf": {token[1]}, "name": {"Support"}, "connection": {id}, "object": {"obj"}, "inbound": {"support@example.com"}, "enabled": {"on"}, "source_f-name": {"cleaned_subject"}, "source_f-body": {"cleaned_body"}, "source_f-status": {"default"}}, true)
 	if w.Code != 303 {
 		t.Fatalf("route save: %d %s", w.Code, w.Body.String())
 	}
@@ -160,5 +162,28 @@ func TestActivityUIShowsFailuresWithoutDraft(t *testing.T) {
 	}
 	if w := request("/admin/activity/email?id=unknown", true); w.Code != 404 {
 		t.Fatal("unknown email should be 404")
+	}
+}
+
+func TestFieldsForLegacyBodyMapping(t *testing.T) {
+	nullable := true
+	object := twenty.Object{Fields: []twenty.Field{{ID: "body", Name: "issueOrRequest", Label: "Issue", Type: "RICH_TEXT", IsNullable: &nullable}, {ID: "name", Name: "name", Label: "Name", Type: "TEXT", IsNullable: &nullable}}}
+	fields := fieldsFor(object, []routing.Mapping{{Field: "issueOrRequest", Source: "body"}, {Field: "name", Source: "subject"}})
+	byName := map[string]fieldView{}
+	for _, field := range fields {
+		byName[field.Field.Name] = field
+	}
+	if byName["issueOrRequest"].Source != "cleaned_body" || byName["name"].Source != "cleaned_subject" {
+		t.Fatalf("legacy mappings were not presented as cleaned values: %+v", fields)
+	}
+	options := map[string]bool{}
+	for _, option := range byName["issueOrRequest"].Sources {
+		options[option.Value] = true
+	}
+	for _, option := range byName["name"].Sources {
+		options[option.Value] = true
+	}
+	if !options["cleaned_body"] || !options["raw_body"] || !options["cleaned_subject"] || !options["raw_subject"] {
+		t.Fatal("body source choices missing")
 	}
 }

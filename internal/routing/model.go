@@ -127,7 +127,7 @@ func Validate(route *Route, object twenty.Object) error {
 			continue
 		}
 		switch m.Source {
-		case "subject", "body", "from", "email_id", "message_id", "received_at":
+		case "subject", "cleaned_subject", "raw_subject", "body", "cleaned_body", "raw_body", "from", "email_id", "message_id", "received_at":
 		default:
 			return fmt.Errorf("unknown mapping source")
 		}
@@ -161,13 +161,24 @@ func (d Destination) Payload(email resend.Email, body string) (map[string]any, e
 		value := m.Value
 		switch m.Source {
 		case "fixed":
-		case "subject":
+		case "subject", "cleaned_subject":
+			value = message.CleanSubject(email.Subject)
+			if strings.TrimSpace(value) == "" {
+				value = "(No subject)"
+			}
+		case "raw_subject":
 			value = email.Subject
 			if strings.TrimSpace(value) == "" {
 				value = "(No subject)"
 			}
-		case "body":
+		case "body", "cleaned_body":
 			value = body
+		case "raw_body":
+			if email.Text != nil {
+				value = *email.Text
+			} else {
+				value = ""
+			}
 		case "from":
 			value = email.From
 		case "email_id":

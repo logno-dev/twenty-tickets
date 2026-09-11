@@ -81,3 +81,41 @@ func TestSnapshotDoesNotFollowRouteEdits(t *testing.T) {
 		t.Fatal("destinations share identity")
 	}
 }
+
+func TestCleanedAndRawBodySources(t *testing.T) {
+	raw := "Please handle.\n\n---------- Forwarded message ---------\nFrom: A <a@example.com>\nDate: Tue\nSubject: Help\nTo: B\n\nPrinter is broken.\n\nOn Mon, B wrote:\n> Older"
+	email := resend.Email{Text: &raw}
+	destination := Destination{Mappings: []Mapping{
+		{Field: "cleaned", Type: "TEXT", Source: "cleaned_body"},
+		{Field: "raw", Type: "TEXT", Source: "raw_body"},
+		{Field: "legacy", Type: "TEXT", Source: "body"},
+	}}
+	fields, err := destination.Payload(email, "Please handle.\n\nPrinter is broken.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fields["cleaned"] != "Please handle.\n\nPrinter is broken." || fields["legacy"] != fields["cleaned"] {
+		t.Fatalf("cleaned body mapping changed: %#v", fields)
+	}
+	if fields["raw"] != raw {
+		t.Fatal("raw body was cleaned")
+	}
+}
+
+func TestCleanedAndRawSubjectSources(t *testing.T) {
+	destination := Destination{Mappings: []Mapping{
+		{Field: "cleaned", Type: "TEXT", Source: "cleaned_subject"},
+		{Field: "raw", Type: "TEXT", Source: "raw_subject"},
+		{Field: "legacy", Type: "TEXT", Source: "subject"},
+	}}
+	fields, err := destination.Payload(resend.Email{Subject: "Re: Fwd: Printer problem"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fields["cleaned"] != "Printer problem" || fields["legacy"] != fields["cleaned"] {
+		t.Fatalf("subject was not cleaned: %#v", fields)
+	}
+	if fields["raw"] != "Re: Fwd: Printer problem" {
+		t.Fatal("raw subject was changed")
+	}
+}

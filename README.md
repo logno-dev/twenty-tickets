@@ -80,8 +80,10 @@ Matching is case-insensitive and compares the complete mailbox. Display names ar
 | Source | Behavior |
 | --- | --- |
 | `default` | Omit the field; Twenty applies its configured default |
-| `subject` | Outer email subject, or `(No subject)` when blank |
-| `body` | Extracted introductory note and first forwarded/top message |
+| `cleaned_subject` | Outer email subject without repeated leading `Re:`, `Fw:`, or `Fwd:` prefixes |
+| `raw_subject` | Exact outer subject returned by Resend |
+| `cleaned_body` | Introductory note plus the first forwarded/top message, without forwarding headers, older quoted history, or recognizable signatures |
+| `raw_body` | Complete plain-text body returned by Resend, including quoted history and forwarding headers |
 | `from` | Outer sender string supplied by Resend |
 | `email_id` | Resend received-email ID |
 | `message_id` | Original email Message-ID |
@@ -89,7 +91,7 @@ Matching is case-insensitive and compares the complete mailbox. Display names ar
 | `fixed` | A configured value validated against the field type |
 | `empty` | Explicit JSON null, available only for nullable fields |
 
-For your Ticket object, the form suggests `name → subject` and `issueOrRequest → body`. Leave Status and Type on `default` to use Twenty's settings. The service does not require or automatically send `generated`; Twenty attributes creation to the API token.
+For your Ticket object, the form suggests `name → cleaned_subject` and `issueOrRequest → cleaned_body`. Existing routes saved with the former `subject` or `body` sources use cleaned content and are shown as the corresponding cleaned option when edited. Blank cleaned or raw subjects become `(No subject)`. Leave Status and Type on `default` to use Twenty's settings. The service does not require or automatically send `generated`; Twenty attributes creation to the API token.
 
 Supported typed mappings:
 
@@ -210,9 +212,9 @@ References: [Resend retrieval](https://resend.com/docs/api-reference/emails/retr
 
 ## Message extraction
 
-The parser keeps the sender's introductory note plus the first forwarded message, or the top message for ordinary emails. It recognizes common English Gmail, Outlook, and Apple Mail separators, wrapped `On … wrote:` boundaries, and `>` quoting. Forwarding headers and older history are removed; signatures inside the selected message are retained.
+The parser keeps the sender's introductory note plus the first forwarded message, or the top message for ordinary emails. It recognizes common English Gmail, Outlook, and Apple Mail separators (including separators made from `-`, `_`, or `=`), wrapped `On … wrote:` boundaries, and `>` quoting. Forwarding headers and older history are removed. It also removes conservative signature patterns: the standard `-- ` delimiter, common sign-offs followed by a short signature block, mobile-client footers, and confidentiality notices. Outer and forwarded-message signatures are handled independently.
 
-This is heuristic parsing. Localized markers, inline/bottom-posted replies, and prose resembling mail headers can need adjustments. Original plain text is retained for later reprocessing. HTML-only messages are saved for review by ID/metadata; HTML, raw MIME, and attachments are not downloaded or stored. Markdown-like text may render as formatting in Twenty.
+This is heuristic parsing. A signature without a recognizable delimiter, sign-off, or footer may remain; localized markers, inline/bottom-posted replies, and prose resembling mail headers can also need adjustments. Original plain text is retained for later reprocessing. HTML-only messages are saved for review by ID/metadata; HTML, raw MIME, and attachments are not downloaded or stored. Markdown-like text may render as formatting in Twenty.
 
 ## Local execution and verification
 

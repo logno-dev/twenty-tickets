@@ -42,8 +42,9 @@ type Handler struct {
 type fieldView struct {
 	Field         twenty.Field
 	Source, Value string
-	Sources       []string
+	Sources       []sourceOption
 }
+type sourceOption struct{ Value, Label string }
 type draftView struct {
 	ID, Subject, Status string
 	Legacy              bool
@@ -267,29 +268,44 @@ func fieldsFor(object twenty.Object, mappings []routing.Mapping) []fieldView {
 		if !f.Editable() {
 			continue
 		}
-		v := fieldView{Field: f, Source: "default", Sources: []string{"default"}}
+		v := fieldView{Field: f, Source: "default", Sources: []sourceOption{{"default", "Twenty default"}}}
 		if f.Supported() {
-			v.Sources = append(v.Sources, "fixed")
+			v.Sources = append(v.Sources, sourceOption{"fixed", "Fixed value"})
 			if f.IsNullable != nil && *f.IsNullable {
-				v.Sources = append(v.Sources, "empty")
+				v.Sources = append(v.Sources, sourceOption{"empty", "Empty (null)"})
 			}
 			if f.Type == "TEXT" || f.Type == "RICH_TEXT" {
-				v.Sources = append(v.Sources, "subject", "body", "from", "email_id", "message_id", "received_at")
+				v.Sources = append(v.Sources,
+					sourceOption{"cleaned_subject", "Cleaned subject"},
+					sourceOption{"raw_subject", "Raw subject"},
+					sourceOption{"cleaned_body", "Cleaned body"},
+					sourceOption{"raw_body", "Raw body"},
+					sourceOption{"from", "Sender"},
+					sourceOption{"email_id", "Resend email ID"},
+					sourceOption{"message_id", "Message ID"},
+					sourceOption{"received_at", "Received at"},
+				)
 			} else if f.Type == "DATE" || f.Type == "DATE_TIME" {
-				v.Sources = append(v.Sources, "received_at")
+				v.Sources = append(v.Sources, sourceOption{"received_at", "Received at"})
 			}
 		}
 		if len(mappings) == 0 {
 			if f.Name == "name" && f.Type == "TEXT" {
-				v.Source = "subject"
+				v.Source = "cleaned_subject"
 			}
 			if f.Name == "issueOrRequest" && f.Type == "RICH_TEXT" {
-				v.Source = "body"
+				v.Source = "cleaned_body"
 			}
 		}
 		for _, m := range mappings {
 			if m.Field == f.Name {
 				v.Source = m.Source
+				if v.Source == "subject" {
+					v.Source = "cleaned_subject"
+				}
+				if v.Source == "body" {
+					v.Source = "cleaned_body"
+				}
 				v.Value = m.Value
 			}
 		}

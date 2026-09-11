@@ -45,6 +45,7 @@ func TestWorkerRetriesOutsideWebhookAndPreservesHistory(t *testing.T) {
 		t.Fatal(inserted, err)
 	}
 	fail := true
+	rawBody := "Please handle.\n\n---------- Forwarded message ---------\nFrom: A <a@example.com>\nDate: Tue\nSubject: Printer\nTo: Support\n\nPRIVATE BODY\n\nOn Mon, B wrote:\n> Older"
 	receiver := receiverFunc(func(ctx context.Context, id string) (resend.Email, error) {
 		if ctx.Err() != nil {
 			t.Fatal("worker inherited an already-cancelled webhook context")
@@ -52,7 +53,7 @@ func TestWorkerRetriesOutsideWebhookAndPreservesHistory(t *testing.T) {
 		if fail {
 			return resend.Email{}, context.DeadlineExceeded
 		}
-		return resend.Email{ID: id, Subject: "Printer", From: "user@example.com", To: []string{"Support <support@example.com>"}, Text: ptr("PRIVATE BODY")}, nil
+		return resend.Email{ID: id, Subject: "Fwd: Printer", From: "user@example.com", To: []string{"Support <support@example.com>"}, Text: ptr(rawBody)}, nil
 	})
 	w := intake.New(queue, receiver, store, routerFunc(func([]string) ([]routing.Destination, error) { return nil, fmt.Errorf("unexpected fallback routing") }), queue, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err := w.Process(context.Background()); err != nil {
@@ -73,7 +74,7 @@ func TestWorkerRetriesOutsideWebhookAndPreservesHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	draft, err := store.Draft("email")
-	if err != nil || draft.Body != "PRIVATE BODY" || len(draft.Destinations) != 1 {
+	if err != nil || draft.Body != "Please handle.\n\nPRIVATE BODY" || !draft.Forwarded || len(draft.Destinations) != 1 {
 		t.Fatalf("draft: %+v %v", draft, err)
 	}
 	if due, _ := queue.DueIntake(context.Background(), now.Add(time.Hour), 10); len(due) != 0 {

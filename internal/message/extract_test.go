@@ -2,6 +2,20 @@ package message
 
 import "testing"
 
+func TestCleanSubject(t *testing.T) {
+	for _, tt := range []struct{ input, want string }{
+		{"Fwd: Printer problem", "Printer problem"},
+		{" RE: FWD: fw: Printer problem ", "Printer problem"},
+		{"Forward planning", "Forward planning"},
+		{"Regarding Re: syntax", "Regarding Re: syntax"},
+		{"Re:", ""},
+	} {
+		if got := CleanSubject(tt.input); got != tt.want {
+			t.Errorf("CleanSubject(%q)=%q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
 func TestExtract(t *testing.T) {
 	tests := []struct {
 		name, subject, input, want string
@@ -20,6 +34,12 @@ func TestExtract(t *testing.T) {
 		{"ordinary prose", "Help", "From: my perspective\nthis needs work.\nOn Tuesday we should meet.", "From: my perspective\nthis needs work.\nOn Tuesday we should meet.", false},
 		{"empty", "Help", "\n\t", "", false},
 		{"quoted blank before headers", "Fwd: Help", "FYI\nBegin forwarded message:\n>\n> From: A\n> Date: Tue\n> To: B\n> Subject: Help\n>\n> Please help.\n>> Old", "FYI\n\nPlease help.", true},
+		{"equals forward and signatures", "Fwd: Help", "FYI\n\nThanks,\nJane\n=============Forwarded============\nFrom: A <a@example.com>\nDate: Tue\nSubject: Help\nTo: B\n\nMy printer is broken.\n\nRegards,\nAlex\nSupport Engineer\nalex@example.com", "FYI\n\nMy printer is broken.", true},
+		{"spaced equals forward", "Fwd: Help", "=== Forwarded message ===\nFrom: A\nDate: Tue\nSubject: Help\nTo: B\n\nFirst message\n\nOn Mon, B wrote:\n> Older", "First message", true},
+		{"standard signature", "Help", "Please fix this.\n\n-- \nJane Example\nSupport", "Please fix this.", false},
+		{"mobile signature", "Help", "Please fix this.\n\nSent from my iPhone", "Please fix this.", false},
+		{"legal footer", "Help", "Please fix this.\n\nConfidentiality Notice: This email is private.", "Please fix this.", false},
+		{"signoff word in prose", "Help", "Thanks,\ncan you also check the toner?", "Thanks,\ncan you also check the toner?", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

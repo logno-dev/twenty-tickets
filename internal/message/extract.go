@@ -7,13 +7,27 @@ import (
 )
 
 var (
-	forwardMarker  = regexp.MustCompile(`(?i)^\s*(?:-+\s*forwarded message\s*-+|begin forwarded message:)\s*$`)
+	forwardMarker  = regexp.MustCompile(`(?i)^\s*(?:begin\s+forwarded\s+message:|(?:[-=_]{3,}\s*)?forwarded(?:\s+message)?(?::)?(?:\s*[-=_]{3,})?)\s*$`)
 	originalMarker = regexp.MustCompile(`(?i)^\s*-+\s*original message\s*-+\s*$`)
 	replyMarker    = regexp.MustCompile(`(?i)^on\s+.+\s+wrote:\s*$`)
 	header         = regexp.MustCompile(`(?i)^(from|sent|date|to|cc|bcc|subject|reply-to):\s*`)
 	forwardSubject = regexp.MustCompile(`(?i)^\s*(fw|fwd):`)
 	blankLines     = regexp.MustCompile(`\n(?:[\t ]*\n){2,}`)
+	signoff        = regexp.MustCompile(`(?i)^(best(?: regards)?|kind regards|regards|thanks|thank you|sincerely|cheers|warm regards|respectfully)[,!]?$`)
+	mobileFooter   = regexp.MustCompile(`(?i)^(sent from my |sent from mail for |get outlook for |sent using )`)
+	legalFooter    = regexp.MustCompile(`(?i)^(confidentiality notice|confidentiality disclaimer|this (?:e-?mail|message) (?:and any attachments )?(?:is|are) confidential)`)
+	subjectPrefix  = regexp.MustCompile(`(?i)^\s*(?:re|fw|fwd)\s*:\s*`)
 )
+
+// CleanSubject removes only conventional reply/forward prefixes. Repeating the
+// match handles subjects such as "Re: Fwd: Re: Printer issue".
+func CleanSubject(subject string) string {
+	cleaned := strings.TrimSpace(subject)
+	for subjectPrefix.MatchString(cleaned) {
+		cleaned = subjectPrefix.ReplaceAllString(cleaned, "")
+	}
+	return strings.TrimSpace(cleaned)
+}
 
 // Extract preserves the introductory note and one forwarded body. The bool
 // reports whether a forward was recognized. This intentionally favors common
@@ -23,6 +37,7 @@ func Extract(text, subject string) (string, bool) {
 	var out []string
 	forwarded := false
 	quoteDepth := 0
+	segmentStart := 0
 	for i := 0; i < len(lines); i++ {
 		line := unquote(lines[i], quoteDepth)
 		trim := strings.TrimSpace(line)
@@ -36,7 +51,9 @@ func Extract(text, subject string) (string, bool) {
 				break
 			}
 			forwarded = true
+			out = stripSignature(out, segmentStart)
 			out = append(out, "")
+			segmentStart = len(out)
 			if !isHeaders {
 				i++
 			}
@@ -82,7 +99,48 @@ func Extract(text, subject string) (string, bool) {
 		}
 		out = append(out, line)
 	}
+	out = stripSignature(out, segmentStart)
 	return strings.TrimSpace(blankLines.ReplaceAllString(strings.Join(out, "\n"), "\n\n")), forwarded
+}
+
+// stripSignature removes only recognizable footer patterns from one message
+// segment. Keeping segment boundaries prevents an outer signature from hiding
+// the forwarded message that follows it.
+func stripSignature(lines []string, start int) []string {
+	if start >= len(lines) {
+		return lines
+	}
+	last := len(lines) - 1
+	for last >= start && strings.TrimSpace(lines[last]) == "" {
+		last--
+	}
+	for i := start; i <= last; i++ {
+		trim := strings.TrimSpace(lines[i])
+		if trim == "--" || mobileFooter.MatchString(trim) || legalFooter.MatchString(trim) {
+			return trimTrailing(lines[:i], start)
+		}
+		if signoff.MatchString(trim) && i > start && strings.TrimSpace(lines[i-1]) == "" && nonEmpty(lines[i+1:last+1]) <= 8 {
+			return trimTrailing(lines[:i], start)
+		}
+	}
+	return lines
+}
+
+func trimTrailing(lines []string, start int) []string {
+	for len(lines) > start && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+func nonEmpty(lines []string) int {
+	n := 0
+	for _, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			n++
+		}
+	}
+	return n
 }
 
 func replyBoundary(lines []string, i, quotes int) bool {
