@@ -1,0 +1,7 @@
+.git
+.env
+.env.*
+data
+twenty-tickets
+*.test
+coverage.out

@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+data/
+twenty-tickets
+*.test
+coverage.out
+.DS_Store

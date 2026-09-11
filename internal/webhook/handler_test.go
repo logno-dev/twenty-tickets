@@ -1,0 +1,236 @@
+package webhook
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"twenty-tickets/internal/delivery"
+	"twenty-tickets/internal/inbox"
+	"twenty-tickets/internal/resend"
+	"twenty-tickets/internal/twenty"
+)
+
+const testKey = "test-signing-key-for-webhook-tests"
+
+func signedRequest(body string, timestamp time.Time) *http.Request {
+	r := httptest.NewRequest(http.MethodPost, "/webhooks/resend", strings.NewReader(body))
+	ts := fmt.Sprint(timestamp.Unix())
+	r.Header.Set("svix-id", "msg_test")
+	r.Header.Set("svix-timestamp", ts)
+	mac := hmac.New(sha256.New, []byte(testKey))
+	mac.Write([]byte("msg_test." + ts + "." + body))
+	r.Header.Set("svix-signature", "v1,"+base64.StdEncoding.EncodeToString(mac.Sum(nil)))
+	return r
+}
+
+func TestWebhookPipeline(t *testing.T) {
+	var calls atomic.Int32
+	var fail atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.URL.Path != "/emails/receiving/email_123" || r.Header.Get("Authorization") != "Bearer re_test" || r.URL.Query().Get("html_format") != "cid" {
+			t.Errorf("unexpected Resend request: %s", r.URL)
+		}
+		if fail.Load() {
+			w.WriteHeader(429)
+			return
+		}
+		io.WriteString(w, `{"id":"email_123","subject":"Help","text":"Please fix it.\n\nOn Tue, A wrote:\n> old"}`)
+	}))
+	defer upstream.Close()
+	receiver, err := resend.NewWithURL(upstream.URL, "re_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	store, err := inbox.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), receiver, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"type":"email.received","data":{"email_id":"email_123"}}`
+	for _, tt := range []struct {
+		name    string
+		request *http.Request
+		status  int
+	}{
+		{"unsigned", httptest.NewRequest("POST", "/webhooks/resend", strings.NewReader(body)), 401},
+		{"stale", signedRequest(body, time.Now().Add(-10*time.Minute)), 401},
+		{"future", signedRequest(body, time.Now().Add(10*time.Minute)), 401},
+		{"malformed", signedRequest(`{`, time.Now()), 400},
+		{"missing id", signedRequest(`{"type":"email.received","data":{}}`, time.Now()), 400},
+		{"wrong event", signedRequest(`{"type":"email.sent"}`, time.Now()), 204},
+		{"large body", signedRequest(strings.Repeat("x", (1<<20)+1), time.Now()), 413},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, tt.request)
+			if w.Code != tt.status {
+				t.Fatalf("got %d, want %d", w.Code, tt.status)
+			}
+		})
+	}
+	tampered := signedRequest(body, time.Now())
+	tampered.Body = io.NopCloser(strings.NewReader(body + " "))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, tampered)
+	if w.Code != 401 || calls.Load() != 0 {
+		t.Fatal("untrusted event reached upstream")
+	}
+	fail.Store(true)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, signedRequest(body, time.Now()))
+	if w.Code != 503 {
+		t.Fatalf("upstream failure returned %d", w.Code)
+	}
+	fail.Store(false)
+	for range 2 {
+		w = httptest.NewRecorder()
+		handler.ServeHTTP(w, signedRequest(body, time.Now()))
+		if w.Code != 204 {
+			t.Fatalf("delivery returned %d: %s", w.Code, w.Body.String())
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("duplicate fetched again: %d calls", calls.Load())
+	}
+	files, err := filepath.Glob(filepath.Join(dir, "*.json"))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("expected one draft: %v, %v", files, err)
+	}
+	b, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var draft inbox.Draft
+	if err := json.Unmarshal(b, &draft); err != nil {
+		t.Fatal(err)
+	}
+	if draft.Body != "Please fix it." || draft.Status != "pending_twenty" || draft.Email.Text == nil {
+		t.Fatalf("unexpected draft: %+v", draft)
+	}
+	// Reopen storage to confirm deduplication survives a process restart.
+	reopened, err := inbox.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists, err := reopened.Exists("email_123"); !exists || err != nil {
+		t.Fatalf("lost saved draft: %v", err)
+	}
+	// Deliver the actual draft produced by the signed webhook to a mock Twenty
+	// endpoint, including its rich-text field and the mandatory generated flag.
+	var creates atomic.Int32
+	crm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			w.WriteHeader(404)
+			return
+		}
+		creates.Add(1)
+		var input struct {
+			ID        string `json:"id"`
+			Name      string `json:"name"`
+			Generated bool   `json:"generated"`
+			Issue     struct {
+				Markdown string `json:"markdown"`
+			} `json:"issueOrRequest"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			t.Error(err)
+		}
+		if r.URL.Path != "/rest/tickets" || input.Name != "Help" || !input.Generated || input.Issue.Markdown != "Please fix it." {
+			t.Errorf("wrong ticket from webhook: %+v", input)
+		}
+		fmt.Fprintf(w, `{"data":{"createTicket":{"id":%q}}}`, input.ID)
+	}))
+	defer crm.Close()
+	client, err := twenty.New(crm.URL, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := delivery.New(reopened, client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	for range 2 {
+		if err := worker.Process(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	receipt, err := reopened.LoadDelivery("email_123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if creates.Load() != 1 || receipt.Status != "delivered" || receipt.TicketID != twenty.TicketID("email_123") {
+		t.Fatalf("bad ticket delivery: %+v, creates=%d", receipt, creates.Load())
+	}
+}
+
+type fakeReceiver struct{ text *string }
+
+func (f fakeReceiver) Receive(_ context.Context, id string) (resend.Email, error) {
+	return resend.Email{ID: id, Text: f.text}, nil
+}
+
+type brokenStore struct{}
+
+func (brokenStore) Exists(string) (bool, error) { return false, nil }
+func (brokenStore) Save(inbox.Draft) error      { return fmt.Errorf("disk full") }
+
+func TestReviewAndStorageFailure(t *testing.T) {
+	for _, text := range []*string{nil, new(string), ptr("> old only")} {
+		dir := t.TempDir()
+		store, err := inbox.New(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), fakeReceiver{text}, store, slog.Default())
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, signedRequest(`{"type":"email.received","data":{"email_id":"test"}}`, time.Now()))
+		if w.Code != 204 {
+			t.Fatal(w.Code)
+		}
+		files, _ := filepath.Glob(filepath.Join(dir, "*.json"))
+		if len(files) != 1 {
+			t.Fatal("missing review record")
+		}
+		b, err := os.ReadFile(files[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		var d inbox.Draft
+		if err := json.Unmarshal(b, &d); err != nil {
+			t.Fatal(err)
+		}
+		if d.Status != "needs_review" || d.ReviewReason == "" {
+			t.Fatalf("missing review flag: %+v", d)
+		}
+	}
+	h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), fakeReceiver{ptr("hello")}, brokenStore{}, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, signedRequest(`{"type":"email.received","data":{"email_id":"test"}}`, time.Now()))
+	if w.Code != 503 {
+		t.Fatalf("storage failure acknowledged: %d", w.Code)
+	}
+}
+
+func ptr(s string) *string { return &s }
