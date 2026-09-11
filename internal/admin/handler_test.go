@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"twenty-tickets/internal/activity"
 	"twenty-tickets/internal/config"
 	"twenty-tickets/internal/inbox"
 )
@@ -91,5 +92,73 @@ func TestAdminFlowAuthenticationCSRFAndSchemaForm(t *testing.T) {
 	routes, err := store.Match([]string{"support@example.com"})
 	if err != nil || len(routes) != 1 {
 		t.Fatalf("route not active: %v %v", routes, err)
+	}
+}
+
+func TestActivityUIShowsFailuresWithoutDraft(t *testing.T) {
+	dir := t.TempDir()
+	store, err := config.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	drafts, err := inbox.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := New(store, drafts, "admin", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for n := range 52 {
+		err = store.RecordActivity(activity.Event{Email: activity.Email{ID: "failed-email", Subject: "Printer <script>alert(1)</script>", From: "person@example.com", To: "support@example.com"}, AttemptID: fmt.Sprintf("attempt-%d", n), Stage: "resend_fetch", Status: "failure", Detail: "context deadline exceeded"})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	request := func(path string, auth bool) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("GET", path, nil)
+		if auth {
+			r.SetBasicAuth("admin", "password")
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	for _, path := range []string{"/admin/activity", "/admin/activity/email?id=failed-email"} {
+		if w := request(path, false); w.Code != 401 {
+			t.Fatal("activity accessible without authentication")
+		}
+	}
+	w := request("/admin/activity?q=Printer", true)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "failed-email") || !strings.Contains(w.Body.String(), "Retrieve from Resend") || !strings.Contains(w.Body.String(), "failure") {
+		t.Fatalf("missing pre-draft failure: %d %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "<script>alert(1)</script>") {
+		t.Fatal("unescaped email subject")
+	}
+	w = request("/admin/activity?q=does-not-match", true)
+	if strings.Contains(w.Body.String(), "failed-email") {
+		t.Fatal("search ignored")
+	}
+	w = request("/admin/activity/email?id=failed-email", true)
+	for _, want := range []string{"person@example.com", "support@example.com", "context deadline exceeded", "Older", "attempt-51"} {
+		if !strings.Contains(w.Body.String(), want) {
+			t.Errorf("detail missing %q", want)
+		}
+	}
+	if strings.Contains(w.Body.String(), "title=\"attempt-0\"") {
+		t.Fatal("event pagination not applied")
+	}
+	w = request("/admin/activity/email?id=failed-email&page=1", true)
+	if !strings.Contains(w.Body.String(), "attempt-0") || !strings.Contains(w.Body.String(), "Newer") {
+		t.Fatal("older event history inaccessible")
+	}
+	w = request("/admin/", true)
+	if !strings.Contains(w.Body.String(), "failed-email") {
+		t.Fatal("homepage hides email without draft")
+	}
+	if w := request("/admin/activity/email?id=unknown", true); w.Code != 404 {
+		t.Fatal("unknown email should be 404")
 	}
 }

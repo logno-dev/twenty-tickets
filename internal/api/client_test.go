@@ -2,11 +2,13 @@ package api
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestFailures(t *testing.T) {
@@ -38,5 +40,38 @@ func TestFailures(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 		})
+	}
+}
+
+func TestConfiguredTimeoutAndCallerCancellation(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
+	defer s.Close()
+	c, err := NewWithTimeout(s.URL, "test", 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output any
+	err = c.DoJSON(context.Background(), "GET", "/slow", nil, &output)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("configured deadline not enforced: %v", err)
+	}
+	c, err = NewWithTimeout(s.URL, "test", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := c.DoJSON(ctx, "GET", "/slow", nil, &output); !errors.Is(err, context.Canceled) {
+		t.Fatalf("caller cancellation ignored: %v", err)
+	}
+	standard, err := New(s.URL, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if standard.http.Timeout != 10*time.Second {
+		t.Fatal("default Twenty timeout changed")
+	}
+	if _, err := NewWithTimeout(s.URL, "test", 0); err == nil {
+		t.Fatal("unbounded timeout accepted")
 	}
 }

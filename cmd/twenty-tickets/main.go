@@ -40,15 +40,35 @@ func run(log *slog.Logger) error {
 		}
 		return nil
 	}
-	if len(os.Args) > 1 {
+	if len(os.Args) > 1 && os.Args[1] != "check-resend" {
 		return fmt.Errorf("unknown command: %s; manage connections at /admin/", os.Args[1])
+	}
+	timeout, err := time.ParseDuration(env("RESEND_HTTP_TIMEOUT", resend.DefaultTimeout.String()))
+	if err != nil {
+		return fmt.Errorf("RESEND_HTTP_TIMEOUT must be a duration such as 30s")
+	}
+	receiver, err := resend.NewWithTimeout(os.Getenv("RESEND_API_KEY"), timeout)
+	if err != nil {
+		return fmt.Errorf("Resend configuration: %w", err)
+	}
+	if len(os.Args) > 1 {
+		if len(os.Args) != 3 {
+			return fmt.Errorf("usage: twenty-tickets check-resend EMAIL_ID")
+		}
+		started := time.Now()
+		email, err := receiver.Receive(context.Background(), os.Args[2])
+		if err != nil {
+			return fmt.Errorf("Resend retrieval diagnostic: %w", err)
+		}
+		bytes := 0
+		if email.Text != nil {
+			bytes = len(*email.Text)
+		}
+		log.Info("Resend retrieval successful", "email_id", email.ID, "elapsed", time.Since(started).Round(time.Millisecond).String(), "plain_text_bytes", bytes)
+		return nil
 	}
 	if os.Getenv("RESEND_WEBHOOK_SECRET") == "" {
 		return fmt.Errorf("RESEND_WEBHOOK_SECRET is required")
-	}
-	receiver, err := resend.New(os.Getenv("RESEND_API_KEY"))
-	if err != nil {
-		return fmt.Errorf("Resend configuration: %w", err)
 	}
 	store, err := inbox.New(env("DATA_DIR", "./data"))
 	if err != nil {
@@ -63,7 +83,7 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	handler, err := webhook.New(os.Getenv("RESEND_WEBHOOK_SECRET"), receiver, store, log, settings)
+	handler, err := webhook.New(os.Getenv("RESEND_WEBHOOK_SECRET"), receiver, store, log, settings, settings)
 	if err != nil {
 		return fmt.Errorf("webhook configuration: %w", err)
 	}
@@ -76,11 +96,11 @@ func run(log *slog.Logger) error {
 	defer stop()
 	workerCtx, cancelWorker := context.WithCancel(ctx)
 	workerDone := make(chan struct{})
-	go func() { defer close(workerDone); delivery.New(store, settings, log).Run(workerCtx) }()
+	go func() { defer close(workerDone); delivery.New(store, settings, log, settings).Run(workerCtx) }()
 	defer func() { cancelWorker(); <-workerDone }()
 	result := make(chan error, 1)
 	go func() { result <- server.ListenAndServe() }()
-	log.Info("webhook service started", "address", server.Addr, "mode", "admin_routing")
+	log.Info("webhook service started", "address", server.Addr, "mode", "admin_routing", "resend_http_timeout", timeout.String())
 	select {
 	case err := <-result:
 		return err

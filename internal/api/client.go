@@ -27,6 +27,13 @@ type Client struct {
 }
 
 func New(base, key string) (*Client, error) {
+	return NewWithTimeout(base, key, 10*time.Second)
+}
+
+func NewWithTimeout(base, key string, timeout time.Duration) (*Client, error) {
+	if timeout <= 0 {
+		return nil, fmt.Errorf("API timeout must be positive")
+	}
 	u, err := url.Parse(base)
 	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return nil, fmt.Errorf("API URL must be an absolute HTTP(S) URL without credentials, query, or fragment")
@@ -35,7 +42,7 @@ func New(base, key string) (*Client, error) {
 		return nil, fmt.Errorf("API key is required")
 	}
 	return &Client{base: strings.TrimRight(base, "/"), key: key, http: &http.Client{
-		Timeout:       10 * time.Second,
+		Timeout:       timeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}}, nil
 }
@@ -63,9 +70,10 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, input, output 
 	if input != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	started := time.Now()
 	res, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("API request failed: %w", err)
+		return fmt.Errorf("API request failed after %s: %w", time.Since(started).Round(time.Millisecond), err)
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {

@@ -30,6 +30,7 @@ The root `/` redirects to `/admin/`. `GET /healthz` is a public liveness check; 
 | Variable | Required | Meaning |
 | --- | --- | --- |
 | `RESEND_API_KEY` | Yes | Permission to retrieve received emails |
+| `RESEND_HTTP_TIMEOUT` | No | Received-email API deadline; `30s` by default, positive and at most `45s` |
 | `RESEND_WEBHOOK_SECRET` | Yes | This endpoint's Resend signing secret |
 | `ADMIN_USERNAME` | Yes | Admin UI username; cannot contain `:` |
 | `ADMIN_PASSWORD` | Yes | Admin UI password |
@@ -105,7 +106,28 @@ Mappings are cached and snapshotted at intake. Refresh the connection and re-sav
 
 ### Delivery dashboard
 
-The home page shows connections, routes, and the latest 100 saved emails with per-route pending/retry/delivered state, record IDs, and retry errors/times. Disabling a route stops it from matching **new** email; it does not cancel deliveries already accepted for that route.
+The home page shows connections, routes, a recent activity summary, and the latest 100 saved drafts with per-route pending/retry/delivered state. Disabling a route stops it from matching **new** email; it does not cancel deliveries already accepted for that route.
+
+### Email activity log
+
+Open **Email activity** at `/admin/activity` to search by subject, sender, recipient, or Resend email ID. The list shows enough metadata to identify the email and the latest recorded outcome for intake and each Twenty destination. Click an email to see its stage-by-stage history:
+
+- Webhook received and signature verified
+- Duplicate check and recipient routing (including ignored emails)
+- Resend retrieval, with a running event saved **before** making the request
+- Message extraction and manual-review outcomes
+- Draft storage and queuing
+- Per-destination field mapping and connection loading
+- Twenty record lookup, creation, or recovery of an existing record
+- Delivery receipt storage, completion, and scheduled retries
+
+**Retrieval failures are visible even when no draft was saved.** Metadata from the verified webhook identifies the email before fetching its body. Separate attempts retain earlier errors after a successful retry. Success in one Twenty instance does not hide failures in another. Outcomes are labeled `running`, `success`, `failure`, `retry`, `review`, or `skipped`, with UTC timestamps and short explanations.
+
+Lists and histories are paginated (50 entries per page); the dashboard previews 10 emails. Refresh the page to see new progress. A `running` event without a subsequent result can also mean the process was interrupted. Activity shows the latest **recorded** outcome; saved drafts/receipts remain the delivery system's authoritative state.
+
+Activity is persisted in `config.db` and survives deploys with the same volume. Email subjects/addresses and error explanations are length-limited; bodies, attachments, field payloads, and API keys are not included. The activity pages require admin authentication. Requests failing signature verification or event validation do not populate the trusted email history.
+
+History starts when this version is deployed; previous console-only failures cannot be reconstructed automatically. Replay a failed Resend event to capture a new attempt. Activity logging is best-effort: if its storage fails, processing continues and `activity log write failed` is written to the application logs. Failure recording uses a short independent deadline so a cancelled retrieval can still be recorded. There is no automatic activity retention/deletion policy; include it in normal volume backups and disk-usage management.
 
 ## Upgrading from environment-based configuration
 
@@ -140,14 +162,30 @@ The worker scans on startup and five seconds after each pass. Retry deadlines st
 
 Record IDs derive deterministically from route ID + Resend email ID. The worker checks `GET /rest/{plural}/{id}?depth=0`, creates only after `404`, supplies the same ID in POST, and verifies `data.create{Singular}.id`. A lost POST response or local receipt write is recovered by looking up that ID next time. Existing records are not overwritten. A soft-deleted record whose ID remains reserved may need manual restoration.
 
-All external API requests have a 10-second timeout and a 16 MiB response limit. Metadata refresh has a 45-second overall deadline. No email content or API keys are logged; the admin UI can show subjects to authenticated administrators.
+Resend retrieval has a configurable 30-second timeout; Twenty API requests have a 10-second timeout. Both have a 16 MiB response limit. Metadata refresh has a 45-second overall deadline. No email content or API keys are logged; the admin UI can show subjects to authenticated administrators.
+
+### Diagnosing Resend retrieval timeouts
+
+An error at `stage=resend_fetch` with `Client.Timeout exceeded while awaiting headers` means the service did not get response headers from Resend before its deadline. It occurs before a draft is saved or any Twenty delivery is attempted. It can indicate a slow Resend response or an outbound network/DNS/TLS problem on the deployment host; increasing the deadline alone does not prove the cause is fixed.
+
+From Coolify's application terminal, run the following with the email ID from the logs:
+
+```sh
+twenty-tickets check-resend EMAIL_ID
+```
+
+This uses the container's `RESEND_API_KEY` and `RESEND_HTTP_TIMEOUT`, performs the real received-email GET, and reports elapsed time and plain-text size. It does not save a draft, create a ticket, or print email contents/credentials. It can also be run natively with `go run ./cmd/twenty-tickets check-resend EMAIL_ID`.
+
+If it succeeds, replay that event from Resend's webhook delivery log to complete intake. If it still times out, check outbound connectivity to `api.resend.com` on the Coolify server and Resend's service status. HTTP `401`/`403` instead points to the API key/access permissions. The diagnostic command requires only the Resend key/timeout, not admin credentials or storage.
+
+`RESEND_HTTP_TIMEOUT=30s` is the default; you may raise it to `45s` if measured response times justify it. A shorter deadline imposed by Resend's webhook sender or your reverse proxy can still cancel synchronous intake; use the diagnostic command to distinguish that from the outbound client deadline. Failed intake returns `503` while the caller remains connected, allowing Resend to retry; events whose retry window expired need manual replay.
 
 ## Persistent data
 
 All state lives under `DATA_DIR`:
 
 ```text
-/data/config.db                 SQLite connections, cached schemas, routes
+/data/config.db                 SQLite connections, schemas, routes, activity history
 /data/config.key                Automatically generated credential-encryption key
 /data/<email-hash>.json         Immutable email drafts and destination snapshots
 /data/deliveries/*.json         Independent delivery receipts/retry state
@@ -197,4 +235,4 @@ go vet ./...
 docker build -t twenty-tickets .
 ```
 
-Tests exercise authenticated admin forms, CSRF protection, schema rendering, metadata pagination/envelopes, encrypted credential persistence, typed mappings, recipient routing, signed webhooks, independent retries, lost responses, failed receipt writes, legacy assignment, parser fixtures, and duplicate handling. Live instance credentials are needed to confirm workspace-specific permissions and schema behavior.
+Tests exercise authenticated admin forms and activity views, CSRF protection, pre-draft failure history, cancellation-safe activity recording, search/pagination, schema rendering, metadata pagination/envelopes, encrypted credential persistence, typed mappings, recipient routing, signed webhooks, independent retries, lost responses, failed receipt writes, legacy assignment, parser fixtures, and duplicate handling. Live instance credentials are needed to confirm workspace-specific permissions and schema behavior.

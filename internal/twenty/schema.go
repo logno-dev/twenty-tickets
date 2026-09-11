@@ -141,6 +141,17 @@ func (c *Client) Objects(ctx context.Context) ([]Object, error) {
 // EnsureRecord uses an immutable, caller-supplied identity and never updates a
 // record during recovery. Field mappings are validated before reaching here.
 func (c *Client) EnsureRecord(ctx context.Context, singular, plural, id string, fields map[string]any) (string, error) {
+	return c.EnsureRecordTracked(ctx, singular, plural, id, fields, nil)
+}
+
+// EnsureRecordTracked reports lookup/creation outcomes without exposing the
+// request payload or credentials. Progress reporting does not control delivery.
+func (c *Client) EnsureRecordTracked(ctx context.Context, singular, plural, id string, fields map[string]any, progress func(string, string, string)) (string, error) {
+	emit := func(stage, status, detail string) {
+		if progress != nil {
+			progress(stage, status, detail)
+		}
+	}
 	if !apiName.MatchString(singular) || !apiName.MatchString(plural) {
 		return "", fmt.Errorf("invalid object API names")
 	}
@@ -150,17 +161,23 @@ func (c *Client) EnsureRecord(ctx context.Context, singular, plural, id string, 
 	var found struct {
 		Data map[string]ticketRecord `json:"data"`
 	}
+	emit("twenty_lookup", "running", "Checking for an existing record with the stable delivery ID.")
 	err := c.REST(ctx, http.MethodGet, "/"+plural+"/"+id+"?depth=0", nil, &found)
 	if err == nil {
 		if err := found.Data[singular].validate(id); err != nil {
+			emit("twenty_lookup", "failure", err.Error())
 			return "", err
 		}
+		emit("twenty_lookup", "success", "Found existing record "+id)
+		emit("twenty_create", "skipped", "Recovered existing record; no duplicate created.")
 		return id, nil
 	}
 	var status *api.StatusError
 	if !errors.As(err, &status) || status.Code != http.StatusNotFound {
+		emit("twenty_lookup", "failure", err.Error())
 		return "", err
 	}
+	emit("twenty_lookup", "success", "No existing record found; creation is needed.")
 	payload := make(map[string]any, len(fields)+1)
 	for key, value := range fields {
 		if !apiName.MatchString(key) || key == "id" {
@@ -172,12 +189,16 @@ func (c *Client) EnsureRecord(ctx context.Context, singular, plural, id string, 
 	var created struct {
 		Data map[string]ticketRecord `json:"data"`
 	}
+	emit("twenty_create", "running", "Creating a record in "+plural+".")
 	if err := c.REST(ctx, http.MethodPost, "/"+plural+"?depth=0", payload, &created); err != nil {
+		emit("twenty_create", "failure", err.Error())
 		return "", err
 	}
 	key := "create" + strings.ToUpper(singular[:1]) + singular[1:]
 	if err := created.Data[key].validate(id); err != nil {
+		emit("twenty_create", "failure", err.Error())
 		return "", err
 	}
+	emit("twenty_create", "success", "Created record "+id)
 	return id, nil
 }

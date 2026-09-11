@@ -6,18 +6,24 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	_ "embed"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"html/template"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"twenty-tickets/internal/activity"
 	"twenty-tickets/internal/config"
 	"twenty-tickets/internal/inbox"
+	"twenty-tickets/internal/resend"
 	"twenty-tickets/internal/routing"
 	"twenty-tickets/internal/twenty"
 )
@@ -52,6 +58,16 @@ type page struct {
 	Objects                          []twenty.Object
 	Fields                           []fieldView
 	Drafts                           []draftView
+	Activities                       []activityRow
+	ActivityEmail                    activity.Email
+	ActivityScopes                   []activity.Event
+	History                          []activity.Event
+	Query, NextURL, PreviousURL      string
+}
+
+type activityRow struct {
+	Email  activity.Email
+	Scopes []activity.Event
 }
 
 func New(store *config.Store, inboxStore *inbox.Store, user, password string) (http.Handler, error) {
@@ -72,6 +88,8 @@ func New(store *config.Store, inboxStore *inbox.Store, user, password string) (h
 	h.mux.HandleFunc("GET /admin/route", h.route)
 	h.mux.HandleFunc("POST /admin/route", h.saveRoute)
 	h.mux.HandleFunc("POST /admin/assign", h.assign)
+	h.mux.HandleFunc("GET /admin/activity", h.activityList)
+	h.mux.HandleFunc("GET /admin/activity/email", h.activityDetail)
 	return h, nil
 }
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -170,6 +188,10 @@ func (h *Handler) home(w http.ResponseWriter, r *http.Request) {
 	p := page{Title: "Twenty Tickets", View: "home", Connections: connections, Routes: routes, Drafts: views, Notice: r.URL.Query().Get("notice")}
 	if err != nil {
 		p.Error = "Some drafts could not be read: " + err.Error()
+	}
+	p.Activities, _, err = h.activityRows(r.Context(), "", 0, 10)
+	if err != nil {
+		p.Error += " Activity log unavailable: " + err.Error()
 	}
 	h.render(w, p)
 }
@@ -319,5 +341,105 @@ func (h *Handler) assign(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, err)
 		return
 	}
+	activity.New(h.store, slog.Default(), activity.Metadata(d.Email), route.ID, route.Name).Emit("legacy_assignment", "success", "Administrator assigned this legacy draft to its original destination.")
 	http.Redirect(w, r, "/admin/?notice="+url.QueryEscape("Legacy draft assigned. Its original stable ticket ID will be reused."), http.StatusSeeOther)
+}
+
+func (h *Handler) activityRows(ctx context.Context, query string, offset, limit int) ([]activityRow, bool, error) {
+	emails, err := h.store.ActivityEmails(ctx, query, offset, limit+1)
+	if err != nil {
+		return nil, false, err
+	}
+	more := len(emails) > limit
+	if more {
+		emails = emails[:limit]
+	}
+	var rows []activityRow
+	for _, email := range emails {
+		scopes, err := h.store.ActivityScopes(ctx, email.ID)
+		if err != nil {
+			return nil, false, err
+		}
+		rows = append(rows, activityRow{Email: email, Scopes: scopes})
+	}
+	return rows, more, nil
+}
+func activityPage(r *http.Request) (int, error) {
+	value := r.URL.Query().Get("page")
+	if value == "" {
+		return 0, nil
+	}
+	p, err := strconv.Atoi(value)
+	if err != nil || p < 0 || p > 1000000 {
+		return 0, fmt.Errorf("invalid activity page")
+	}
+	return p, nil
+}
+func pageURL(path string, values url.Values, p int) string {
+	values.Set("page", strconv.Itoa(p))
+	return path + "?" + values.Encode()
+}
+func (h *Handler) activityList(w http.ResponseWriter, r *http.Request) {
+	n, err := activityPage(r)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	query := r.URL.Query().Get("q")
+	rows, more, err := h.activityRows(r.Context(), query, n*50, 50)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	p := page{Title: "Email activity", View: "activity", Activities: rows, Query: query}
+	if more {
+		p.NextURL = pageURL("/admin/activity", url.Values{"q": {query}}, n+1)
+	}
+	if n > 0 {
+		p.PreviousURL = pageURL("/admin/activity", url.Values{"q": {query}}, n-1)
+	}
+	h.render(w, p)
+}
+func (h *Handler) activityDetail(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if !resend.ValidID(id) {
+		http.Error(w, "Invalid email ID", 400)
+		return
+	}
+	n, err := activityPage(r)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	email, err := h.store.ActivityEmail(r.Context(), id)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "No activity recorded for this email yet. Detailed history starts after the activity-log version is deployed.", 404)
+		return
+	}
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	events, err := h.store.ActivityEvents(r.Context(), id, n*50, 51)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	more := len(events) > 50
+	if more {
+		events = events[:50]
+	}
+	scopes, err := h.store.ActivityScopes(r.Context(), id)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	p := page{Title: "Email processing history", View: "activity_detail", ActivityEmail: email, ActivityScopes: scopes, History: events}
+	if more {
+		p.NextURL = pageURL("/admin/activity/email", url.Values{"id": {id}}, n+1)
+	}
+	if n > 0 {
+		p.PreviousURL = pageURL("/admin/activity/email", url.Values{"id": {id}}, n-1)
+	}
+	h.render(w, p)
 }

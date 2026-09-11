@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"twenty-tickets/internal/config"
 	"twenty-tickets/internal/delivery"
 	"twenty-tickets/internal/inbox"
 	"twenty-tickets/internal/message"
@@ -63,7 +64,7 @@ func TestWebhookPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), receiver, store, slog.New(slog.NewTextHandler(io.Discard, nil)), testRouter{})
+	handler, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), receiver, store, slog.New(slog.NewTextHandler(io.Discard, nil)), testRouter{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +166,7 @@ func TestWebhookPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worker := delivery.New(reopened, testConnections{client}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	worker := delivery.New(reopened, testConnections{client}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	for range 2 {
 		if err := worker.Process(context.Background()); err != nil {
 			t.Fatal(err)
@@ -198,7 +199,7 @@ func TestReviewAndStorageFailure(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), fakeReceiver{text}, store, slog.Default(), testRouter{})
+		h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), fakeReceiver{text}, store, slog.Default(), testRouter{}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -223,7 +224,7 @@ func TestReviewAndStorageFailure(t *testing.T) {
 			t.Fatalf("missing review flag: %+v", d)
 		}
 	}
-	h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), fakeReceiver{ptr("hello")}, brokenStore{}, slog.Default(), testRouter{})
+	h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), fakeReceiver{ptr("hello")}, brokenStore{}, slog.Default(), testRouter{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +273,7 @@ func TestRecipientFiltering(t *testing.T) {
 				fetches++
 				return resend.Email{ID: id, To: tt.fetchedTo, CC: []string{"support@example.com"}, From: "support@example.com", Text: ptr("Newest message\nTo: support@example.com")}, nil
 			})
-			h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), receiver, store, slog.New(slog.NewTextHandler(io.Discard, nil)), testRouter{filter: filter, inbound: "support@example.com"})
+			h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), receiver, store, slog.New(slog.NewTextHandler(io.Discard, nil)), testRouter{filter: filter, inbound: "support@example.com"}, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -313,6 +314,90 @@ type testConnections struct{ client *twenty.Client }
 
 func (c testConnections) Client(string) (*twenty.Client, error) { return c.client, nil }
 
+func TestActivityTracksFetchTimeoutAndSuccessfulRetry(t *testing.T) {
+	settings, err := config.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer settings.Close()
+	store, err := inbox.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fail := true
+	receiver := receiverFunc(func(_ context.Context, id string) (resend.Email, error) {
+		if fail {
+			cancel()
+			return resend.Email{}, context.DeadlineExceeded
+		}
+		return resend.Email{ID: id, Subject: "Printer problem", From: "user@example.com", To: []string{"support@example.com"}, Text: ptr("PRIVATE BODY must not enter the activity log")}, nil
+	})
+	h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), receiver, store, slog.New(slog.NewTextHandler(io.Discard, nil)), testRouter{}, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"type":"email.received","data":{"email_id":"activity-email","subject":"Printer problem","from":"user@example.com","to":["support@example.com"]}}`
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, signedRequest(body, time.Now()).WithContext(ctx))
+	if w.Code != 503 {
+		t.Fatal(w.Code)
+	}
+	if exists, _ := store.Exists("activity-email"); exists {
+		t.Fatal("failed fetch created a draft")
+	}
+	rows, err := settings.ActivityEmails(context.Background(), "Printer", 0, 50)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("timeout not visible without a draft: %v %v", rows, err)
+	}
+	events, err := settings.ActivityEvents(context.Background(), "activity-email", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if events[0].Stage != "resend_fetch" || events[0].Status != "failure" {
+		t.Fatalf("cancelled request failure not persisted: %+v", events[0])
+	}
+	firstAttempt := events[0].AttemptID
+	fail = false
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, signedRequest(body, time.Now()))
+	if w.Code != 204 {
+		t.Fatal(w.Code)
+	}
+	events, err = settings.ActivityEvents(context.Background(), "activity-email", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if events[0].Stage != "queued" || events[0].Status != "success" || events[0].AttemptID == firstAttempt {
+		t.Fatal("retry not tracked as a new successful attempt")
+	}
+	foundFailure, foundParsing := false, false
+	for _, event := range events {
+		if event.Stage == "resend_fetch" && event.Status == "failure" {
+			foundFailure = true
+		}
+		if event.Stage == "parsing" && event.Status == "success" {
+			foundParsing = true
+		}
+		if strings.Contains(event.Detail, "PRIVATE BODY") {
+			t.Fatal("email body leaked into activity")
+		}
+	}
+	if !foundFailure || !foundParsing {
+		t.Fatal("stage history missing")
+	}
+	count := len(events)
+	unsigned := signedRequest(body, time.Now())
+	unsigned.Header.Del("svix-signature")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, unsigned)
+	events, _ = settings.ActivityEvents(context.Background(), "activity-email", 0, 100)
+	if w.Code != 401 || len(events) != count {
+		t.Fatal("unverified request populated trusted email history")
+	}
+}
+
 type routerFunc func([]string) ([]routing.Destination, error)
 
 func (f routerFunc) Match(to []string) ([]routing.Destination, error) { return f(to) }
@@ -333,7 +418,7 @@ func TestRoutingSnapshotAndSetupFailure(t *testing.T) {
 			}
 			return []routing.Destination{{RouteID: "a", Inbound: "a@example.com"}, {RouteID: "b", Inbound: "b@example.com"}}, nil
 		})
-		h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), receiver, store, slog.New(slog.NewTextHandler(io.Discard, nil)), router)
+		h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), receiver, store, slog.New(slog.NewTextHandler(io.Discard, nil)), router, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

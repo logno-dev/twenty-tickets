@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"twenty-tickets/internal/config"
 	"twenty-tickets/internal/inbox"
 	"twenty-tickets/internal/resend"
 	"twenty-tickets/internal/routing"
@@ -83,13 +84,18 @@ func destination(id string) routing.Destination {
 	return routing.Destination{RouteID: id, ConnectionID: id, Singular: "ticket", Plural: "tickets", Mappings: []routing.Mapping{{Field: "name", Type: "TEXT", Source: "subject"}, {Field: "issueOrRequest", Type: "RICH_TEXT", Source: "body"}}}
 }
 func testWorker(store Store, c connections, now *time.Time) *Worker {
-	w := New(store, c, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	w := New(store, c, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	w.pause = 0
 	w.now = func() time.Time { return *now }
 	return w
 }
 func TestIndependentDestinationsAndRestart(t *testing.T) {
 	dir := t.TempDir()
+	journal, err := config.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
 	store, err := inbox.New(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -104,6 +110,7 @@ func TestIndependentDestinationsAndRestart(t *testing.T) {
 	c := connections{"a": ca, "b": cb}
 	now := time.Now()
 	w := testWorker(store, c, &now)
+	w.recorder = journal
 	if err := w.Process(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -115,11 +122,23 @@ func TestIndependentDestinationsAndRestart(t *testing.T) {
 	if err != nil || second.Status != "retry" || second.Attempts != 1 || !second.NextAttemptAt.Equal(now.Add(30*time.Second)) {
 		t.Fatalf("b: %+v %v", second, err)
 	}
+	scopes, err := journal.ActivityScopes(context.Background(), "email")
+	if err != nil {
+		t.Fatal(err)
+	}
+	latest := map[string]string{}
+	for _, scope := range scopes {
+		latest[scope.RouteID] = scope.Status
+	}
+	if latest["a"] != "success" || latest["b"] != "retry" {
+		t.Fatal("activity scopes merged successful and failed destinations", latest)
+	}
 	store, err = inbox.New(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	w = testWorker(store, c, &now)
+	w.recorder = journal
 	b.mu.Lock()
 	b.fail = false
 	b.lose = true
@@ -139,6 +158,28 @@ func TestIndependentDestinationsAndRestart(t *testing.T) {
 	if err != nil || second.Status != "delivered" {
 		t.Fatalf("retry recovery: %+v %v", second, err)
 	}
+	events, err := journal.ActivityEvents(context.Background(), "email", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedLookup, failedCreate, recovered := false, false, false
+	for _, event := range events {
+		if event.RouteID != "b" {
+			continue
+		}
+		if event.Stage == "twenty_lookup" && event.Status == "failure" {
+			failedLookup = true
+		}
+		if event.Stage == "twenty_create" && event.Status == "failure" {
+			failedCreate = true
+		}
+		if event.Stage == "twenty_create" && event.Status == "skipped" {
+			recovered = true
+		}
+	}
+	if !failedLookup || !failedCreate || !recovered {
+		t.Fatal("missing lookup, create, or recovery activity")
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	b.mu.Lock()
@@ -152,6 +193,11 @@ type receiptFailure struct{ *inbox.Store }
 
 func (receiptFailure) SaveDelivery(inbox.Delivery) error { return fmt.Errorf("disk full") }
 func TestReceiptFailureRecoveryAndLegacyHold(t *testing.T) {
+	journal, err := config.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
 	store, err := inbox.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -169,8 +215,13 @@ func TestReceiptFailureRecoveryAndLegacyHold(t *testing.T) {
 	now := time.Now()
 	clients := connections{"a": c}
 	w := testWorker(receiptFailure{store}, clients, &now)
+	w.recorder = journal
 	if err := w.Process(context.Background()); err == nil {
 		t.Fatal("receipt failure ignored")
+	}
+	events, err := journal.ActivityEvents(context.Background(), "new", 0, 100)
+	if err != nil || len(events) == 0 || events[0].Stage != "receipt_save" || events[0].Status != "failure" {
+		t.Fatalf("receipt failure not visible: %+v %v", events, err)
 	}
 	w = testWorker(store, clients, &now)
 	if err := w.Process(context.Background()); err != nil {

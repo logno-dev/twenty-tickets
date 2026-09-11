@@ -95,7 +95,12 @@ func Open(dir string) (*Store, error) {
 	_, err = db.Exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;
 	CREATE TABLE IF NOT EXISTS connections (id TEXT PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, secret BLOB NOT NULL, objects BLOB NOT NULL, synced_at TEXT NOT NULL);
 	CREATE TABLE IF NOT EXISTS routes (id TEXT PRIMARY KEY, connection_id TEXT NOT NULL REFERENCES connections(id), definition BLOB NOT NULL);
-	PRAGMA user_version=1;`)
+	CREATE TABLE IF NOT EXISTS activity_emails (email_id TEXT PRIMARY KEY, subject TEXT NOT NULL, sender TEXT NOT NULL, recipients TEXT NOT NULL, first_seen INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_event INTEGER NOT NULL);
+	CREATE TABLE IF NOT EXISTS activity_events (id INTEGER PRIMARY KEY AUTOINCREMENT, email_id TEXT NOT NULL REFERENCES activity_emails(email_id), occurred_at INTEGER NOT NULL, attempt_id TEXT NOT NULL, webhook_id TEXT NOT NULL, route_id TEXT NOT NULL, route_name TEXT NOT NULL, stage TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL);
+	CREATE INDEX IF NOT EXISTS activity_email_order ON activity_emails(last_event DESC);
+	CREATE INDEX IF NOT EXISTS activity_event_email ON activity_events(email_id,id DESC);
+	CREATE INDEX IF NOT EXISTS activity_event_scope ON activity_events(email_id,route_id,id DESC);
+	PRAGMA user_version=2;`)
 	if err != nil {
 		db.Close()
 		return nil, err

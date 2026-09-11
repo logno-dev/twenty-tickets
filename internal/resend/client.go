@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"time"
 
 	"twenty-tickets/internal/api"
 )
@@ -27,10 +28,24 @@ func ValidID(id string) bool { return validID.MatchString(id) }
 
 type Client struct{ api *api.Client }
 
-func New(key string) (*Client, error) { return NewWithURL("https://api.resend.com", key) }
+const DefaultTimeout = 30 * time.Second
+const MaxTimeout = 45 * time.Second
+
+func New(key string) (*Client, error) { return NewWithTimeout(key, DefaultTimeout) }
+
+func NewWithTimeout(key string, timeout time.Duration) (*Client, error) {
+	if timeout <= 0 || timeout > MaxTimeout {
+		return nil, fmt.Errorf("RESEND_HTTP_TIMEOUT must be greater than zero and at most 45s")
+	}
+	c, err := api.NewWithTimeout("https://api.resend.com", key, timeout)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{api: c}, nil
+}
 
 func NewWithURL(base, key string) (*Client, error) {
-	c, err := api.New(base, key)
+	c, err := api.NewWithTimeout(base, key, DefaultTimeout)
 	if err != nil {
 		return nil, err
 	}
