@@ -24,7 +24,7 @@ type Store interface {
 	Save(inbox.Draft) error
 }
 
-func New(secret string, receiver Receiver, store Store, log *slog.Logger) (http.Handler, error) {
+func New(secret string, receiver Receiver, store Store, log *slog.Logger, recipient message.RecipientFilter) (http.Handler, error) {
 	verifier, err := svix.NewWebhook(secret)
 	if err != nil {
 		return nil, err
@@ -50,7 +50,8 @@ func New(secret string, receiver Receiver, store Store, log *slog.Logger) (http.
 		var event struct {
 			Type string `json:"type"`
 			Data struct {
-				EmailID string `json:"email_id"`
+				EmailID string   `json:"email_id"`
+				To      []string `json:"to"`
 			} `json:"data"`
 		}
 		if err := json.Unmarshal(payload, &event); err != nil || event.Type == "" {
@@ -64,6 +65,16 @@ func New(secret string, receiver Receiver, store Store, log *slog.Logger) (http.
 		id := event.Data.EmailID
 		if !resend.ValidID(id) {
 			http.Error(w, "invalid email_id", http.StatusBadRequest)
+			return
+		}
+		ignore := func() {
+			log.Info("email ignored", "email_id", id, "reason", "recipient_mismatch")
+			w.WriteHeader(http.StatusNoContent)
+		}
+		// Use verified webhook recipients to avoid fetching unrelated emails.
+		// If absent, fall back to the received-email API response below.
+		if len(event.Data.To) > 0 && !recipient.Matches(event.Data.To) {
+			ignore()
 			return
 		}
 		fail := func(stage string, err error) {
@@ -82,6 +93,10 @@ func New(secret string, receiver Receiver, store Store, log *slog.Logger) (http.
 		email, err := receiver.Receive(r.Context(), id)
 		if err != nil {
 			fail("resend_fetch", err)
+			return
+		}
+		if !recipient.Matches(email.To) {
+			ignore()
 			return
 		}
 		draft := inbox.Draft{Version: 1, EventID: r.Header.Get("svix-id"), SavedAt: time.Now().UTC(), Status: "pending_twenty", Email: email}

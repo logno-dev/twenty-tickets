@@ -95,8 +95,7 @@ func (c *Client) EnsureTicket(ctx context.Context, emailID, subject, body string
 		IssueOrRequest struct {
 			Markdown string `json:"markdown"`
 		} `json:"issueOrRequest"`
-		Generated bool `json:"generated"`
-	}{ID: id, Name: subject, Generated: true}
+	}{ID: id, Name: subject}
 	input.IssueOrRequest.Markdown = body
 	var created struct {
 		Data struct {

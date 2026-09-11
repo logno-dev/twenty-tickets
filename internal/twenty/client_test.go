@@ -70,8 +70,8 @@ func TestTicketCreationAndRecovery(t *testing.T) {
 					w.WriteHeader(400)
 					return
 				}
-				if len(payload) != 4 || string(payload["generated"]) != "true" {
-					t.Errorf("expected exactly agreed fields with boolean generated=true: %s", payload)
+				if len(payload) != 3 || payload["generated"] != nil {
+					t.Errorf("expected only id, name and issueOrRequest; generated must be omitted: %s", payload)
 				}
 				var name, actualID string
 				json.Unmarshal(payload["name"], &name)
@@ -176,13 +176,12 @@ func TestEmptySubjectAndBody(t *testing.T) {
 		}
 		posts++
 		var input struct {
-			ID, Name  string
-			Generated bool
+			ID, Name string
 		}
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 			t.Error(err)
 		}
-		if input.Name != "(No subject)" || !input.Generated {
+		if input.Name != "(No subject)" {
 			t.Errorf("bad fallback: %+v", input)
 		}
 		fmt.Fprintf(w, `{"data":{"createTicket":{"id":%q}}}`, input.ID)
@@ -230,8 +229,8 @@ func TestConcurrentTicketCreation(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 			t.Error(err)
 		}
-		if input["id"] != id || input["generated"] != true {
-			t.Error("unstable creation identity or generated flag")
+		if input["id"] != id {
+			t.Error("unstable creation identity")
 		}
 		created = true
 		creates++

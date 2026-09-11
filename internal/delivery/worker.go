@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"twenty-tickets/internal/inbox"
+	"twenty-tickets/internal/message"
 )
 
 type Tickets interface {
@@ -22,15 +23,16 @@ type Store interface {
 }
 
 type Worker struct {
-	store   Store
-	tickets Tickets
-	log     *slog.Logger
-	now     func() time.Time
-	pause   time.Duration
+	store     Store
+	tickets   Tickets
+	log       *slog.Logger
+	now       func() time.Time
+	pause     time.Duration
+	recipient message.RecipientFilter
 }
 
-func New(store Store, tickets Tickets, log *slog.Logger) *Worker {
-	return &Worker{store: store, tickets: tickets, log: log, now: time.Now, pause: 2 * time.Second}
+func New(store Store, tickets Tickets, log *slog.Logger, recipient message.RecipientFilter) *Worker {
+	return &Worker{store: store, tickets: tickets, log: log, now: time.Now, pause: 2 * time.Second, recipient: recipient}
 }
 
 // Run uses one worker per volume. Two-second spacing between attempts keeps
@@ -50,7 +52,7 @@ func (w *Worker) Run(ctx context.Context) {
 // It must not be called concurrently on the same volume.
 func (w *Worker) Process(ctx context.Context) error {
 	return w.store.EachDraft(ctx, func(d inbox.Draft) error {
-		if d.Status != "pending_twenty" {
+		if d.Status != "pending_twenty" || !w.recipient.Matches(d.Email.To) {
 			return nil
 		}
 		state, err := w.store.LoadDelivery(d.Email.ID)

@@ -2,12 +2,13 @@
 
 A Go service for Resend inbound email webhooks, packaged for Docker and Coolify.
 
-**Flow:** verify the webhook → fetch the received email → extract the sender's note and first forwarded message → save a durable draft → create a Twenty ticket with **`generated: true`**. A background worker delivers saved drafts when Twenty credentials are configured.
+**Flow:** verify the webhook → fetch the received email → extract the sender's note and first forwarded message → save a durable draft → create a Twenty ticket. A background worker delivers saved drafts when Twenty credentials are configured.
 
 ## Request flow
 
 1. Resend sends `email.received` to `POST /webhooks/resend`.
 2. The official Svix Go library verifies the signature against the **raw body**, including its timestamp tolerance. Keep the server clock synchronized.
+   When `INBOUND_EMAIL_TO` is set, unrelated To recipients are ignored with `204`. Verified webhook recipients are checked before fetching when present, and the fetched email's To recipients are checked before saving.
 3. The service checks whether the email ID already exists in its inbox.
 4. It calls `GET https://api.resend.com/emails/receiving/{email_id}?html_format=cid` using the Resend API key. The `cid` option avoids large base64 inline images; extraction uses the response's `text` field.
 5. It extracts the newest useful content and atomically saves a JSON file before returning `204`.
@@ -33,12 +34,27 @@ References: [Receiving email](https://resend.com/docs/dashboard/receiving/introd
 | --- | --- | --- |
 | `RESEND_API_KEY` | Yes | API key allowed to retrieve received emails |
 | `RESEND_WEBHOOK_SECRET` | Yes | Webhook endpoint's `whsec_...` signing secret |
+| `INBOUND_EMAIL_TO` | No | Only accept this To mailbox, e.g. `support@example.com`; empty accepts all |
 | `TWENTY_BASE_URL` | With Twenty key | Instance root, e.g. `https://crm.example.com`, without `/rest` |
 | `TWENTY_API_KEY` | With Twenty URL | Twenty workspace API key |
 | `PORT` | No | `8080` |
 | `DATA_DIR` | No | `./data` natively; `/data` in Docker |
 
-Leave both Twenty variables empty for inbox-only operation. **Setting both enables automatic ticket creation for new and already-saved pending drafts on service startup.** Use a Twenty key with read/create access to Tickets and write access to `name`, `issueOrRequest`, and `generated`. The explicit connectivity command below also requires metadata read access.
+Leave both Twenty variables empty for inbox-only operation. **Setting both enables automatic ticket creation for new and already-saved pending drafts on service startup.** Use a Twenty key with read/create access to Tickets and write access to `name` and `issueOrRequest`. The explicit connectivity command below also requires metadata read access.
+
+### Recipient filter
+
+Set this **runtime** variable in Coolify, then redeploy:
+
+```env
+INBOUND_EMAIL_TO=support@example.com
+```
+
+The filter matches any address in the outer email's **To** array, case-insensitively. Display names such as `Support <support@example.com>` are supported. Matching uses the complete mailbox; plus tags and aliases are distinct. CC/BCC, the sender, and To headers inside forwarded message text do not count. The filter uses the To data Resend provides, not SMTP envelope-recipient or forwarding-header inference.
+
+Leave the variable empty to accept all recipients. A malformed nonempty setting prevents startup. With filtering enabled, missing or malformed To addresses do not match. Unrelated emails return `204` without saving a draft or creating a ticket; the log records `email ignored` with reason `recipient_mismatch`.
+
+The delivery worker applies the same filter to existing pending drafts. Nonmatching saved drafts remain on disk and become eligible if the setting is changed or cleared. Newly ignored emails are not saved, so replay their Resend webhooks if you later want to process them under a different filter.
 
 ## Local execution
 
@@ -126,14 +142,13 @@ Tickets are created using `POST /rest/tickets?depth=0` with this payload shape:
   "name": "Email subject",
   "issueOrRequest": {
     "markdown": "Introductory note\n\nFirst forwarded message"
-  },
-  "generated": true
+  }
 }
 ```
 
 - **Name:** outer email subject, falling back to `(No subject)` if blank.
 - **Issue or Request:** extracted body in `issueOrRequest.markdown`. Twenty converts Markdown into its rich-text representation. Markdown-like syntax in the email may render as formatting.
-- **Generated:** always the JSON boolean `true` on creation.
+- **Attribution:** Twenty records creation by the API token. The service does not send or require a `generated` field.
 - **Status and Type:** omitted so Twenty applies its configured defaults (`status` / `typeCustom`). Example values `OPEN` and `BUG` in the API response are not forced by this service.
 - **Resolution, App relationship, actors, timestamps and other fields:** omitted; system values/defaults are managed by Twenty.
 
@@ -149,4 +164,4 @@ go vet ./...
 docker build -t twenty-tickets .
 ```
 
-Tests cover real HMAC-signed webhook requests through ticket creation against mock APIs, boolean `generated: true`, rich-text mapping, preservation of Twenty defaults, lost creation responses, concurrent duplicate creation, persisted retry deadlines, failed receipt writes, review-record skipping, parser fixtures, and bounded API responses. Live Resend and Twenty credentials are needed for end-to-end deployment verification.
+Tests cover real HMAC-signed webhook requests through ticket creation against mock APIs, recipient matching and filtering of new/saved emails, omission of the removed `generated` field, rich-text mapping, preservation of Twenty defaults, lost creation responses, concurrent duplicate creation, persisted retry deadlines, failed receipt writes, review-record skipping, parser fixtures, and bounded API responses. Live Resend and Twenty credentials are needed for end-to-end deployment verification.

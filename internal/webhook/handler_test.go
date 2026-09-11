@@ -20,6 +20,7 @@ import (
 
 	"twenty-tickets/internal/delivery"
 	"twenty-tickets/internal/inbox"
+	"twenty-tickets/internal/message"
 	"twenty-tickets/internal/resend"
 	"twenty-tickets/internal/twenty"
 )
@@ -61,7 +62,7 @@ func TestWebhookPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), receiver, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	handler, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), receiver, store, slog.New(slog.NewTextHandler(io.Discard, nil)), message.RecipientFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +136,7 @@ func TestWebhookPipeline(t *testing.T) {
 		t.Fatalf("lost saved draft: %v", err)
 	}
 	// Deliver the actual draft produced by the signed webhook to a mock Twenty
-	// endpoint, including its rich-text field and the mandatory generated flag.
+	// endpoint, including its rich-text field.
 	var creates atomic.Int32
 	crm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "GET" {
@@ -144,17 +145,16 @@ func TestWebhookPipeline(t *testing.T) {
 		}
 		creates.Add(1)
 		var input struct {
-			ID        string `json:"id"`
-			Name      string `json:"name"`
-			Generated bool   `json:"generated"`
-			Issue     struct {
+			ID    string `json:"id"`
+			Name  string `json:"name"`
+			Issue struct {
 				Markdown string `json:"markdown"`
 			} `json:"issueOrRequest"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 			t.Error(err)
 		}
-		if r.URL.Path != "/rest/tickets" || input.Name != "Help" || !input.Generated || input.Issue.Markdown != "Please fix it." {
+		if r.URL.Path != "/rest/tickets" || input.Name != "Help" || input.Issue.Markdown != "Please fix it." {
 			t.Errorf("wrong ticket from webhook: %+v", input)
 		}
 		fmt.Fprintf(w, `{"data":{"createTicket":{"id":%q}}}`, input.ID)
@@ -164,7 +164,7 @@ func TestWebhookPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worker := delivery.New(reopened, client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	worker := delivery.New(reopened, client, slog.New(slog.NewTextHandler(io.Discard, nil)), message.RecipientFilter{})
 	for range 2 {
 		if err := worker.Process(context.Background()); err != nil {
 			t.Fatal(err)
@@ -197,7 +197,7 @@ func TestReviewAndStorageFailure(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), fakeReceiver{text}, store, slog.Default())
+		h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), fakeReceiver{text}, store, slog.Default(), message.RecipientFilter{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -222,7 +222,7 @@ func TestReviewAndStorageFailure(t *testing.T) {
 			t.Fatalf("missing review flag: %+v", d)
 		}
 	}
-	h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), fakeReceiver{ptr("hello")}, brokenStore{}, slog.Default())
+	h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), fakeReceiver{ptr("hello")}, brokenStore{}, slog.Default(), message.RecipientFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,3 +234,64 @@ func TestReviewAndStorageFailure(t *testing.T) {
 }
 
 func ptr(s string) *string { return &s }
+
+type receiverFunc func(context.Context, string) (resend.Email, error)
+
+func (f receiverFunc) Receive(ctx context.Context, id string) (resend.Email, error) {
+	return f(ctx, id)
+}
+
+func TestRecipientFiltering(t *testing.T) {
+	filter, err := message.NewRecipientFilter("support@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name                    string
+		eventTo, fetchedTo      []string
+		unsigned                bool
+		wantStatus, wantFetches int
+		wantSaved               bool
+	}{
+		{"matching", []string{"support@example.com"}, []string{"Support <SUPPORT@example.com>"}, false, 204, 1, true},
+		{"unrelated event", []string{"other@example.com"}, nil, false, 204, 0, false},
+		{"missing event To falls back", nil, []string{"other@example.com", "support@example.com"}, false, 204, 1, true},
+		{"fetched recipient differs", []string{"support@example.com"}, []string{"other@example.com"}, false, 204, 1, false},
+		{"missing all recipients", nil, nil, false, 204, 1, false},
+		{"CC and sender do not count", nil, []string{"other@example.com"}, false, 204, 1, false},
+		{"verification before filtering", []string{"other@example.com"}, nil, true, 401, 0, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store, err := inbox.New(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			fetches := 0
+			receiver := receiverFunc(func(_ context.Context, id string) (resend.Email, error) {
+				fetches++
+				return resend.Email{ID: id, To: tt.fetchedTo, CC: []string{"support@example.com"}, From: "support@example.com", Text: ptr("Newest message\nTo: support@example.com")}, nil
+			})
+			h, err := New("whsec_"+base64.StdEncoding.EncodeToString([]byte(testKey)), receiver, store, slog.New(slog.NewTextHandler(io.Discard, nil)), filter)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := json.Marshal(map[string]any{"type": "email.received", "data": map[string]any{"email_id": "email_filter", "to": tt.eventTo}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := signedRequest(string(body), time.Now())
+			if tt.unsigned {
+				r.Header.Del("svix-signature")
+			}
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != tt.wantStatus || fetches != tt.wantFetches {
+				t.Fatalf("status=%d fetches=%d; want %d %d", w.Code, fetches, tt.wantStatus, tt.wantFetches)
+			}
+			exists, err := store.Exists("email_filter")
+			if err != nil || exists != tt.wantSaved {
+				t.Fatalf("saved=%v; want %v, error=%v", exists, tt.wantSaved, err)
+			}
+		})
+	}
+}

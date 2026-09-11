@@ -13,6 +13,7 @@ import (
 
 	"twenty-tickets/internal/delivery"
 	"twenty-tickets/internal/inbox"
+	"twenty-tickets/internal/message"
 	"twenty-tickets/internal/resend"
 	"twenty-tickets/internal/twenty"
 	"twenty-tickets/internal/webhook"
@@ -63,6 +64,10 @@ func run(log *slog.Logger) error {
 	if os.Getenv("RESEND_WEBHOOK_SECRET") == "" {
 		return fmt.Errorf("RESEND_WEBHOOK_SECRET is required")
 	}
+	recipient, err := message.NewRecipientFilter(os.Getenv("INBOUND_EMAIL_TO"))
+	if err != nil {
+		return err
+	}
 	receiver, err := resend.New(os.Getenv("RESEND_API_KEY"))
 	if err != nil {
 		return fmt.Errorf("Resend configuration: %w", err)
@@ -71,7 +76,7 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("inbox initialization: %w", err)
 	}
-	handler, err := webhook.New(os.Getenv("RESEND_WEBHOOK_SECRET"), receiver, store, log)
+	handler, err := webhook.New(os.Getenv("RESEND_WEBHOOK_SECRET"), receiver, store, log, recipient)
 	if err != nil {
 		return fmt.Errorf("webhook configuration: %w", err)
 	}
@@ -85,7 +90,7 @@ func run(log *slog.Logger) error {
 		mode = "twenty_tickets"
 		go func() {
 			defer close(workerDone)
-			delivery.New(store, twentyClient, log).Run(workerCtx)
+			delivery.New(store, twentyClient, log, recipient).Run(workerCtx)
 		}()
 	} else {
 		close(workerDone)

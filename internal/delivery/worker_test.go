@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"twenty-tickets/internal/inbox"
+	"twenty-tickets/internal/message"
 	"twenty-tickets/internal/resend"
 )
 
@@ -26,7 +27,7 @@ func (f *fakeTickets) EnsureTicket(_ context.Context, id, subject, body string) 
 }
 
 func newTestWorker(store Store, tickets Tickets, now *time.Time) *Worker {
-	w := New(store, tickets, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	w := New(store, tickets, slog.New(slog.NewTextHandler(io.Discard, nil)), message.RecipientFilter{})
 	w.now = func() time.Time { return *now }
 	w.pause = 0
 	return w
@@ -149,5 +150,52 @@ func TestCancellationAndBackoff(t *testing.T) {
 	}
 	if backoff(1) != 30*time.Second || backoff(2) != time.Minute || backoff(100) != 30*time.Minute {
 		t.Fatal("bad retry backoff")
+	}
+}
+
+func TestRecipientFilterAppliesToSavedDrafts(t *testing.T) {
+	store, err := inbox.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id, to := range map[string][]string{
+		"matching": {"Support <SUPPORT@example.com>"},
+		"other":    {"other@example.com"},
+		"missing":  nil,
+	} {
+		if err := store.Save(inbox.Draft{Version: 1, Email: resend.Email{ID: id, To: to}, Body: "Body", Status: "pending_twenty"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tickets := &fakeTickets{}
+	now := time.Now()
+	w := newTestWorker(store, tickets, &now)
+	w.recipient, err = message.NewRecipientFilter("support@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Process(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if tickets.calls != 1 {
+		t.Fatalf("sent %d tickets, want only matching recipient", tickets.calls)
+	}
+	state, err := store.LoadDelivery("matching")
+	if err != nil || state.Status != "delivered" {
+		t.Fatalf("missing matching delivery: %+v %v", state, err)
+	}
+	for _, id := range []string{"other", "missing"} {
+		state, err := store.LoadDelivery(id)
+		if err != nil || state.Status != "" || state.Attempts != 0 {
+			t.Fatalf("filtered draft marked attempted: %+v %v", state, err)
+		}
+	}
+	// Filtering does not delete the old backlog; clearing the setting makes it eligible again.
+	w = newTestWorker(store, tickets, &now)
+	if err := w.Process(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if tickets.calls != 3 {
+		t.Fatalf("backlog was lost or delivered again: %d", tickets.calls)
 	}
 }
