@@ -55,6 +55,9 @@ func TestConfiguredTimeoutAndCallerCancellation(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("configured deadline not enforced: %v", err)
 	}
+	if !strings.Contains(err.Error(), "waiting for response headers") {
+		t.Fatalf("request phase missing: %v", err)
+	}
 	c, err = NewWithTimeout(s.URL, "test", time.Second)
 	if err != nil {
 		t.Fatal(err)

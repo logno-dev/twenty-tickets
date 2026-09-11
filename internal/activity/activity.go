@@ -64,6 +64,10 @@ func (e Event) StageLabel() string {
 		return "Webhook received"
 	case "signature_verified":
 		return "Signature verification"
+	case "intake_queue":
+		return "Queue verified email"
+	case "intake_retry":
+		return "Schedule intake retry"
 	case "inbox_lookup":
 		return "Duplicate check"
 	case "routing":

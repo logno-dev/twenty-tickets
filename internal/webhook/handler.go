@@ -8,30 +8,24 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
 	svix "github.com/svix/svix-webhooks/go"
 	"twenty-tickets/internal/activity"
-	"twenty-tickets/internal/inbox"
-	"twenty-tickets/internal/message"
+	"twenty-tickets/internal/intake"
 	"twenty-tickets/internal/resend"
 	"twenty-tickets/internal/routing"
 )
 
-type Receiver interface {
-	Receive(context.Context, string) (resend.Email, error)
-}
-type Store interface {
-	Exists(string) (bool, error)
-	Save(inbox.Draft) error
+type Queue interface {
+	EnqueueIntake(context.Context, intake.Event) (bool, error)
 }
 
 type Router interface {
 	Match([]string) ([]routing.Destination, error)
 }
 
-func New(secret string, receiver Receiver, store Store, log *slog.Logger, router Router, recorder activity.Recorder) (http.Handler, error) {
+func New(secret string, queue Queue, log *slog.Logger, router Router, recorder activity.Recorder) (http.Handler, error) {
 	verifier, err := svix.NewWebhook(secret)
 	if err != nil {
 		return nil, err
@@ -90,19 +84,8 @@ func New(secret string, receiver Receiver, store Store, log *slog.Logger, router
 			log.Error("email processing failed", "email_id", id, "stage", stage, "error", err)
 			http.Error(w, "processing failed; retry later", http.StatusServiceUnavailable)
 		}
-		exists, err := store.Exists(id)
-		if err != nil {
-			fail("inbox_lookup", err)
-			return
-		}
-		if exists {
-			trace.Emit("inbox_lookup", "skipped", "Draft already saved. This duplicate webhook does not queue another delivery.")
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		trace.Emit("inbox_lookup", "success", "New email; no saved draft found.")
-		// Route once from verified event recipients when present, then confirm
-		// against the fetched To array. Configuration changes cannot retarget it.
+		// Snapshot routes from verified event recipients before acknowledging so
+		// later configuration changes cannot retarget an accepted email.
 		var destinations []routing.Destination
 		if len(event.Data.To) > 0 {
 			trace.Emit("routing", "running", "Matching verified To recipients against enabled routes.")
@@ -115,73 +98,21 @@ func New(secret string, receiver Receiver, store Store, log *slog.Logger, router
 				ignore()
 				return
 			}
-			trace.Emit("routing", "success", fmt.Sprintf("Selected %d destination(s); recipients will be confirmed after retrieval.", len(destinations)))
+			trace.Emit("routing", "success", fmt.Sprintf("Snapshotted %d destination(s); recipients will be confirmed after retrieval.", len(destinations)))
 		}
-		trace.Emit("resend_fetch", "running", "Requesting received email content from Resend.")
-		email, err := receiver.Receive(r.Context(), id)
+		e := intake.Event{Version: 1, WebhookID: r.Header.Get("svix-id"), Email: resend.Email{ID: id, Subject: event.Data.Subject, From: event.Data.From, To: event.Data.To}, Destinations: destinations, QueuedAt: time.Now().UTC()}
+		queueCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Second)
+		inserted, err := queue.EnqueueIntake(queueCtx, e)
+		cancel()
 		if err != nil {
-			fail("resend_fetch", err)
+			fail("intake_queue", err)
 			return
 		}
-		trace.SetEmail(email)
-		trace.Emit("resend_fetch", "success", "Received email content from Resend.")
-		if len(event.Data.To) == 0 {
-			destinations, err = router.Match(email.To)
-			if err != nil {
-				fail("routing", err)
-				return
-			}
+		if inserted {
+			trace.Emit("intake_queue", "success", "Verified event committed for background retrieval.")
 		} else {
-			// Each snapshot includes its matched inbound mailbox.
-			matched := destinations[:0]
-			for _, destination := range destinations {
-				filter, _ := message.NewRecipientFilter(destination.Inbound)
-				if filter.Matches(email.To) {
-					matched = append(matched, destination)
-				}
-			}
-			destinations = matched
+			trace.Emit("intake_queue", "skipped", "Email is already present in the durable intake queue.")
 		}
-		if len(destinations) == 0 {
-			ignore()
-			return
-		}
-		names := make([]string, 0, len(destinations))
-		for _, destination := range destinations {
-			name := destination.RouteName
-			if name == "" {
-				name = destination.RouteID
-			}
-			names = append(names, name)
-		}
-		trace.Emit("routing", "success", "Confirmed destinations: "+strings.Join(names, ", "))
-		trace.Emit("parsing", "running", "Extracting the top message and introductory note.")
-		draft := inbox.Draft{Version: 2, EventID: r.Header.Get("svix-id"), SavedAt: time.Now().UTC(), Status: "pending_twenty", Email: email, Destinations: destinations}
-		if email.Text == nil || strings.TrimSpace(*email.Text) == "" {
-			draft.Status, draft.ReviewReason = "needs_review", "missing_plain_text"
-		} else {
-			draft.Body, draft.Forwarded = message.Extract(*email.Text, email.Subject)
-			if draft.Body == "" {
-				draft.Status, draft.ReviewReason = "needs_review", "empty_extraction"
-			}
-		}
-		if draft.Status == "needs_review" {
-			trace.Emit("parsing", "review", draft.ReviewReason+"; manual review required.")
-		} else {
-			trace.Emit("parsing", "success", fmt.Sprintf("Extracted %d bytes; forwarded message recognized: %t.", len(draft.Body), draft.Forwarded))
-		}
-		trace.Emit("inbox_save", "running", "Writing the draft and frozen destination mappings.")
-		if err := store.Save(draft); err != nil {
-			fail("inbox_save", err)
-			return
-		}
-		trace.Emit("inbox_save", "success", "Draft saved to persistent storage.")
-		if draft.Status == "needs_review" {
-			trace.Emit("queued", "review", "Saved for review; automatic delivery skipped.")
-		} else {
-			trace.Emit("queued", "success", fmt.Sprintf("Queued for %d destination(s).", len(destinations)))
-		}
-		log.Info("email saved", "email_id", id, "status", draft.Status, "body_bytes", len(draft.Body), "forwarded", draft.Forwarded)
 		w.WriteHeader(http.StatusNoContent)
 	})
 	return mux, nil

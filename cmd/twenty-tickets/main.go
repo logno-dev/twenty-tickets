@@ -15,6 +15,7 @@ import (
 	"twenty-tickets/internal/config"
 	"twenty-tickets/internal/delivery"
 	"twenty-tickets/internal/inbox"
+	"twenty-tickets/internal/intake"
 	"twenty-tickets/internal/resend"
 	"twenty-tickets/internal/webhook"
 )
@@ -83,7 +84,7 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	handler, err := webhook.New(os.Getenv("RESEND_WEBHOOK_SECRET"), receiver, store, log, settings, settings)
+	handler, err := webhook.New(os.Getenv("RESEND_WEBHOOK_SECRET"), settings, log, settings, settings)
 	if err != nil {
 		return fmt.Errorf("webhook configuration: %w", err)
 	}
@@ -95,9 +96,14 @@ func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	workerCtx, cancelWorker := context.WithCancel(ctx)
-	workerDone := make(chan struct{})
-	go func() { defer close(workerDone); delivery.New(store, settings, log, settings).Run(workerCtx) }()
-	defer func() { cancelWorker(); <-workerDone }()
+	intakeDone := make(chan struct{})
+	deliveryDone := make(chan struct{})
+	go func() {
+		defer close(intakeDone)
+		intake.New(settings, receiver, store, settings, settings, log).Run(workerCtx)
+	}()
+	go func() { defer close(deliveryDone); delivery.New(store, settings, log, settings).Run(workerCtx) }()
+	defer func() { cancelWorker(); <-intakeDone; <-deliveryDone }()
 	result := make(chan error, 1)
 	go func() { result <- server.ListenAndServe() }()
 	log.Info("webhook service started", "address", server.Addr, "mode", "admin_routing", "resend_http_timeout", timeout.String())

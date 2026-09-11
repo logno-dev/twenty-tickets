@@ -23,6 +23,8 @@ One Go service receives Resend email webhooks and creates records in one or more
 7. Add a Twenty connection and a route as described below.
 8. In Resend, point an `email.received` webhook to **`https://tickets.example.com/webhooks/resend`**.
 
+Coolify's Dockerfile build pack does **not** use the named volume in `compose.yaml`. Add the `/data` mount in the resource's **Persistent Storage** settings and keep that same storage entry attached across redeploys. Recreating the Coolify resource creates a new storage association unless the original volume is explicitly reattached. If the admin configuration unexpectedly appears empty, do not delete or prune volumes: stop the service and recover the old volume containing both `config.db` and `config.key`.
+
 The root `/` redirects to `/admin/`. `GET /healthz` is a public liveness check; configure it on port 8080 in Coolify. The image also includes a Docker health check. Allow at least 25 seconds for graceful shutdown.
 
 ## Environment variables
@@ -113,7 +115,7 @@ The home page shows connections, routes, a recent activity summary, and the late
 Open **Email activity** at `/admin/activity` to search by subject, sender, recipient, or Resend email ID. The list shows enough metadata to identify the email and the latest recorded outcome for intake and each Twenty destination. Click an email to see its stage-by-stage history:
 
 - Webhook received and signature verified
-- Duplicate check and recipient routing (including ignored emails)
+- Recipient routing and durable intake queueing (including ignored emails)
 - Resend retrieval, with a running event saved **before** making the request
 - Message extraction and manual-review outcomes
 - Draft storage and queuing
@@ -127,7 +129,7 @@ Lists and histories are paginated (50 entries per page); the dashboard previews 
 
 Activity is persisted in `config.db` and survives deploys with the same volume. Email subjects/addresses and error explanations are length-limited; bodies, attachments, field payloads, and API keys are not included. The activity pages require admin authentication. Requests failing signature verification or event validation do not populate the trusted email history.
 
-History starts when this version is deployed; previous console-only failures cannot be reconstructed automatically. Replay a failed Resend event to capture a new attempt. Activity logging is best-effort: if its storage fails, processing continues and `activity log write failed` is written to the application logs. Failure recording uses a short independent deadline so a cancelled retrieval can still be recorded. There is no automatic activity retention/deletion policy; include it in normal volume backups and disk-usage management.
+History starts when this version is deployed; previous console-only failures cannot be reconstructed automatically. Replay a failed Resend event to capture a new attempt. Activity logging is best-effort: if its storage fails, processing continues and `activity log write failed` is written to the application logs. There is no automatic activity retention/deletion policy; include it in normal volume backups and disk-usage management.
 
 ## Upgrading from environment-based configuration
 
@@ -150,15 +152,15 @@ The old `check-twenty` CLI command is replaced by the connection form's test/ref
 ## Processing and reliability
 
 1. Verify the raw webhook with the official Svix library, including timestamp tolerance.
-2. Check for an existing draft to deduplicate webhook deliveries.
-3. Match enabled routes using the signed event's To recipients when provided. Unmatched events are skipped before fetching content. If To is missing, retrieve the email first and route using its To recipients.
-4. Fetch `GET https://api.resend.com/emails/receiving/{id}?html_format=cid`, using the plain-text `text` field. Confirm event-selected routes against the fetched To recipients.
-5. Extract the message and atomically save a version-2 draft containing immutable destination/mapping snapshots. Only then return `204`.
-6. A background worker delivers each destination independently, using current credentials for the snapshotted connection.
+2. Match enabled routes using the signed event's To recipients when provided. Unmatched events are skipped before fetching content.
+3. Commit the event metadata and immutable destination/mapping snapshots to SQLite, then return `204`. Duplicate webhook deliveries resolve to the same queue entry by Resend email ID.
+4. A background intake worker fetches `GET https://api.resend.com/emails/receiving/{id}?html_format=cid` independently of the webhook connection. If the signed event omitted To, it routes using the fetched recipients; otherwise it confirms the snapshots against them.
+5. Extract the message and atomically save a version-2 draft. Retrieval or storage failures remain queued and retry after 30 seconds, doubling to a 30-minute cap.
+6. A separate background delivery worker sends each destination independently, using current credentials for the snapshotted connection.
 
-A `204` acknowledges durable intake or an intentionally ignored event, not completed Twenty delivery. Missing plain text or empty extraction is saved as `needs_review`. API or storage failures during intake return `503`; invalid signatures return `401`; invalid events return `400`; bodies over 1 MiB return `413`.
+A `204` acknowledges durable intake or an intentionally ignored event, not retrieval or Twenty delivery. A failure to commit the intake event returns `503`; retrieval failures happen after acknowledgement and retry from SQLite. Missing plain text or empty extraction is saved as `needs_review`. Invalid signatures return `401`; invalid events return `400`; bodies over 1 MiB return `413`.
 
-The worker scans on startup and five seconds after each pass. Retry deadlines start at 30 seconds, double, and cap at 30 minutes. They survive restarts and failed destinations retry indefinitely. One failed destination does not discard or repeat successful deliveries to another. Attempts are spaced by two seconds across this single worker; each attempt makes at most two Twenty requests. Run one service instance per persistent volume.
+The intake and delivery workers scan on startup and five seconds after each pass. Both retry schedules survive restarts. Intake retrieval retries indefinitely; destination retries are also independent and indefinite. One failed destination does not discard or repeat successful deliveries to another. Twenty attempts are spaced by two seconds across the delivery worker; each attempt makes at most two Twenty requests. Run one service instance per persistent volume.
 
 Record IDs derive deterministically from route ID + Resend email ID. The worker checks `GET /rest/{plural}/{id}?depth=0`, creates only after `404`, supplies the same ID in POST, and verifies `data.create{Singular}.id`. A lost POST response or local receipt write is recovered by looking up that ID next time. Existing records are not overwritten. A soft-deleted record whose ID remains reserved may need manual restoration.
 
@@ -166,7 +168,7 @@ Resend retrieval has a configurable 30-second timeout; Twenty API requests have 
 
 ### Diagnosing Resend retrieval timeouts
 
-An error at `stage=resend_fetch` with `Client.Timeout exceeded while awaiting headers` means the service did not get response headers from Resend before its deadline. It occurs before a draft is saved or any Twenty delivery is attempted. It can indicate a slow Resend response or an outbound network/DNS/TLS problem on the deployment host; increasing the deadline alone does not prove the cause is fixed.
+An error at `stage=resend_fetch` occurs before a draft is saved or any Twenty delivery is attempted. API errors identify whether the request was resolving DNS, connecting, negotiating TLS, waiting for response headers, or reading the response. This can distinguish a slow Resend response from an outbound network problem on the deployment host; increasing the deadline alone does not prove the cause is fixed.
 
 From Coolify's application terminal, run the following with the email ID from the logs:
 
@@ -176,16 +178,16 @@ twenty-tickets check-resend EMAIL_ID
 
 This uses the container's `RESEND_API_KEY` and `RESEND_HTTP_TIMEOUT`, performs the real received-email GET, and reports elapsed time and plain-text size. It does not save a draft, create a ticket, or print email contents/credentials. It can also be run natively with `go run ./cmd/twenty-tickets check-resend EMAIL_ID`.
 
-If it succeeds, replay that event from Resend's webhook delivery log to complete intake. If it still times out, check outbound connectivity to `api.resend.com` on the Coolify server and Resend's service status. HTTP `401`/`403` instead points to the API key/access permissions. The diagnostic command requires only the Resend key/timeout, not admin credentials or storage.
+If it succeeds, a queued event should also succeed on its next automatic attempt. If it still times out, check outbound connectivity to `api.resend.com` on the Coolify server and Resend's service status. HTTP `401`/`403` instead points to the API key/access permissions. The diagnostic command requires only the Resend key/timeout, not admin credentials or storage.
 
-`RESEND_HTTP_TIMEOUT=30s` is the default; you may raise it to `45s` if measured response times justify it. A shorter deadline imposed by Resend's webhook sender or your reverse proxy can still cancel synchronous intake; use the diagnostic command to distinguish that from the outbound client deadline. Failed intake returns `503` while the caller remains connected, allowing Resend to retry; events whose retry window expired need manual replay.
+`RESEND_HTTP_TIMEOUT=30s` is the default; you may raise it to `45s` if measured response times justify it. The webhook sender's deadline no longer cancels retrieval because the verified event is committed before the background request starts. A queued event retries automatically after a timeout; manual replay is needed only for failures that happened before this durable-intake version was deployed or before queue commit.
 
 ## Persistent data
 
 All state lives under `DATA_DIR`:
 
 ```text
-/data/config.db                 SQLite connections, schemas, routes, activity history
+/data/config.db                 SQLite connections, routes, pending intake, activity history
 /data/config.key                Automatically generated credential-encryption key
 /data/<email-hash>.json         Immutable email drafts and destination snapshots
 /data/deliveries/*.json         Independent delivery receipts/retry state
@@ -195,6 +197,8 @@ All state lives under `DATA_DIR`:
 SQLite uses WAL and FULL synchronous mode. API keys are AES-GCM encrypted in the database with the installation key in `config.key`. The key and database are owner-only files; protection of the complete mounted volume still matters because it contains both. No additional encryption environment variable is needed. An existing database with a missing encryption key fails to open rather than silently replacing the key.
 
 Back up the **whole volume**, including `config.key`. Stop the service before taking a plain filesystem copy so SQLite's database/WAL and file-based drafts are consistent. Losing the key loses access to stored credentials; losing delivery state may cause reprocessing. Keep the volume tied to its original Twenty workspaces. There is no automatic retention policy; manage backups and disk usage. The file store requires hard-link and directory-sync support, as provided by ordinary local Docker volumes.
+
+For Coolify Dockerfile deployments, verify the resource's persistent-storage destination is exactly `/data`. `compose.yaml` is not applied in that deployment mode. Before replacing or recreating a resource, record the volume name shown by Coolify so it can be reattached. The database and key are a pair; attaching or copying only one is not a valid recovery.
 
 ## Resend setup
 

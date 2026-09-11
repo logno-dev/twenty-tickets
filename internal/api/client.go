@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -71,9 +73,22 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, input, output 
 		req.Header.Set("Content-Type", "application/json")
 	}
 	started := time.Now()
+	phase := "starting request"
+	var phaseMu sync.Mutex
+	setPhase := func(value string) { phaseMu.Lock(); phase = value; phaseMu.Unlock() }
+	getPhase := func() string { phaseMu.Lock(); defer phaseMu.Unlock(); return phase }
+	trace := &httptrace.ClientTrace{
+		DNSStart:             func(httptrace.DNSStartInfo) { setPhase("resolving DNS") },
+		ConnectStart:         func(_, _ string) { setPhase("connecting") },
+		TLSHandshakeStart:    func() { setPhase("negotiating TLS") },
+		GotConn:              func(httptrace.GotConnInfo) { setPhase("writing request") },
+		WroteRequest:         func(httptrace.WroteRequestInfo) { setPhase("waiting for response headers") },
+		GotFirstResponseByte: func() { setPhase("reading response body") },
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 	res, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("API request failed after %s: %w", time.Since(started).Round(time.Millisecond), err)
+		return fmt.Errorf("API request failed after %s while %s: %w", time.Since(started).Round(time.Millisecond), getPhase(), err)
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
@@ -81,7 +96,7 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, input, output 
 	}
 	b, err := io.ReadAll(io.LimitReader(res.Body, MaxResponseBytes+1))
 	if err != nil {
-		return err
+		return fmt.Errorf("API response read failed after %s: %w", time.Since(started).Round(time.Millisecond), err)
 	}
 	if len(b) > MaxResponseBytes {
 		return fmt.Errorf("API response exceeds %d bytes", MaxResponseBytes)
