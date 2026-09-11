@@ -2,6 +2,6 @@
 .env
 .env.*
 data
-twenty-tickets
+/twenty-tickets
 *.test
 coverage.out

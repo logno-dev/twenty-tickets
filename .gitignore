@@ -2,7 +2,7 @@
 .env.*
 !.env.example
 data/
-twenty-tickets
+/twenty-tickets
 *.test
 coverage.out
 .DS_Store
