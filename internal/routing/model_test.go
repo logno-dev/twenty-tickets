@@ -121,15 +121,15 @@ func TestCleanedAndRawSubjectSources(t *testing.T) {
 }
 
 func TestSenderDomainRestriction(t *testing.T) {
-	route := Route{Name: "Support", Inbound: "support@example.com", FromDomain: "@SomeDomain.COM", ObjectID: "obj", Enabled: true, Mappings: []Mapping{{Field: "name", Source: "cleaned_subject"}}}
+	route := Route{Name: "Support", Inbound: "support@example.com", FromDomain: "@SomeDomain.COM, Partner.org, somedomain.com", ObjectID: "obj", Enabled: true, Mappings: []Mapping{{Field: "name", Source: "cleaned_subject"}}}
 	if err := Validate(&route, schema(t)); err != nil {
 		t.Fatal(err)
 	}
-	if route.FromDomain != "somedomain.com" {
+	if route.FromDomain != "somedomain.com, partner.org" {
 		t.Fatal("domain was not normalized:", route.FromDomain)
 	}
 	to := []string{"support@example.com"}
-	if !route.Matches(to, "Person <USER@SOMEDOMAIN.COM>") || !route.Matches(to, "") {
+	if !route.Matches(to, "Person <USER@SOMEDOMAIN.COM>") || !route.Matches(to, "user@partner.org") || !route.Matches(to, "") {
 		t.Fatal("allowed or provisional sender did not match")
 	}
 	if route.Matches(to, "user@other.com") || route.Matches(to, "user@sub.somedomain.com") || route.Matches(to, "not an address") {
@@ -139,7 +139,7 @@ func TestSenderDomainRestriction(t *testing.T) {
 	if !destination.Matches(to, "user@somedomain.com") || destination.Matches(to, "") || destination.Matches(to, "user@other.com") {
 		t.Fatal("snapshot did not enforce sender domain")
 	}
-	for _, domain := range []string{"https://somedomain.com", "*.somedomain.com", "user@somedomain.com", "localhost", "-bad.com"} {
+	for _, domain := range []string{"https://somedomain.com", "*.somedomain.com", "user@somedomain.com", "localhost", "-bad.com", "good.com,", "good.com, bad domain"} {
 		invalid := route
 		invalid.FromDomain = domain
 		if err := Validate(&invalid, schema(t)); err == nil {

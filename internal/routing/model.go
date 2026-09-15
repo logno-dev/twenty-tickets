@@ -67,7 +67,16 @@ func matchesDomain(from, allowed string) bool {
 		return false
 	}
 	at := strings.LastIndexByte(address.Address, '@')
-	return at > 0 && strings.EqualFold(address.Address[at+1:], allowed)
+	if at <= 0 {
+		return false
+	}
+	domain := address.Address[at+1:]
+	for _, candidate := range strings.Split(allowed, ",") {
+		if strings.EqualFold(domain, strings.TrimSpace(candidate)) {
+			return true
+		}
+	}
+	return false
 }
 func (d Destination) RecordID(emailID string) string {
 	if d.Legacy {
@@ -83,10 +92,11 @@ func Validate(route *Route, object twenty.Object) error {
 	if _, err := message.NewRecipientFilter(route.Inbound); err != nil {
 		return err
 	}
-	route.FromDomain = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(route.FromDomain), "@")))
-	if len(route.FromDomain) > 253 || (route.FromDomain != "" && !domainPattern.MatchString(route.FromDomain)) {
-		return fmt.Errorf("allowed sender domain must be a domain such as example.com")
+	domains, err := normalizeDomains(route.FromDomain)
+	if err != nil {
+		return err
 	}
+	route.FromDomain = domains
 	if !object.Valid() || route.ObjectID != object.ID {
 		return fmt.Errorf("select a valid object")
 	}
@@ -164,6 +174,29 @@ func Validate(route *Route, object twenty.Object) error {
 	}
 	route.Singular, route.Plural = object.NameSingular, object.NamePlural
 	return nil
+}
+
+func normalizeDomains(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	if len(value) > 2048 {
+		return "", fmt.Errorf("allowed sender domains are too long")
+	}
+	seen := map[string]bool{}
+	var domains []string
+	for _, raw := range strings.Split(value, ",") {
+		domain := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(raw), "@")))
+		if len(domain) > 253 || !domainPattern.MatchString(domain) {
+			return "", fmt.Errorf("allowed sender domains must be comma-separated domains such as example.com, partner.org")
+		}
+		if !seen[domain] {
+			seen[domain] = true
+			domains = append(domains, domain)
+		}
+	}
+	return strings.Join(domains, ", "), nil
 }
 
 func (d Destination) Payload(email resend.Email, body string) (map[string]any, error) {

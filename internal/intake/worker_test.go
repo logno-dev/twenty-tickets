@@ -166,7 +166,7 @@ func TestWorkerRejectsRetrievedSenderOutsideSnapshottedDomain(t *testing.T) {
 		WebhookID: "webhook",
 		Email:     resend.Email{ID: "restricted", From: "user@somedomain.com", To: []string{"support@example.com"}},
 		Destinations: []routing.Destination{{
-			RouteID: "route", Inbound: "support@example.com", FromDomain: "somedomain.com",
+			RouteID: "route", Inbound: "support@example.com", FromDomain: "somedomain.com, partner.org",
 		}},
 		QueuedAt: time.Now().UTC(),
 	}

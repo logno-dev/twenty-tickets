@@ -87,7 +87,7 @@ func TestAdminFlowAuthenticationCSRFAndSchemaForm(t *testing.T) {
 			t.Fatalf("schema-aware form missing %s: %s", want, w.Body.String())
 		}
 	}
-	w = request("POST", "/admin/route", url.Values{"csrf": {token[1]}, "name": {"Support"}, "connection": {id}, "object": {"obj"}, "inbound": {"support@example.com"}, "from_domain": {"SomeDomain.COM"}, "enabled": {"on"}, "source_f-name": {"cleaned_subject"}, "source_f-body": {"cleaned_body"}, "source_f-status": {"default"}}, true)
+	w = request("POST", "/admin/route", url.Values{"csrf": {token[1]}, "name": {"Support"}, "connection": {id}, "object": {"obj"}, "inbound": {"support@example.com"}, "from_domain": {"SomeDomain.COM, @Partner.org, somedomain.com"}, "enabled": {"on"}, "source_f-name": {"cleaned_subject"}, "source_f-body": {"cleaned_body"}, "source_f-status": {"default"}}, true)
 	if w.Code != 303 {
 		t.Fatalf("route save: %d %s", w.Code, w.Body.String())
 	}
@@ -95,7 +95,7 @@ func TestAdminFlowAuthenticationCSRFAndSchemaForm(t *testing.T) {
 	if err != nil || len(routes) != 1 {
 		t.Fatalf("route not active: %v %v", routes, err)
 	}
-	if routes[0].FromDomain != "somedomain.com" {
+	if routes[0].FromDomain != "somedomain.com, partner.org" {
 		t.Fatal("sender domain was not normalized and snapshotted")
 	}
 	savedRoutes, err := store.Routes()
@@ -103,8 +103,11 @@ func TestAdminFlowAuthenticationCSRFAndSchemaForm(t *testing.T) {
 		t.Fatal("saved route unavailable", err)
 	}
 	w = request("GET", "/admin/route?id="+savedRoutes[0].ID, nil, true)
-	if !strings.Contains(w.Body.String(), `name="from_domain" value="somedomain.com"`) {
+	if !strings.Contains(w.Body.String(), `name="from_domain" value="somedomain.com, partner.org"`) {
 		t.Fatal("sender restriction missing from edit form")
+	}
+	if partner, err := store.Match([]string{"support@example.com"}, "user@partner.org"); err != nil || len(partner) != 1 {
+		t.Fatal("second allowed domain did not match")
 	}
 	if blocked, err := store.Match([]string{"support@example.com"}, "user@other.com"); err != nil || len(blocked) != 0 {
 		t.Fatal("disallowed sender matched route")
