@@ -36,7 +36,7 @@ type Receiver interface {
 }
 
 type Router interface {
-	Match([]string) ([]routing.Destination, error)
+	Match([]string, string) ([]routing.Destination, error)
 }
 
 type Store interface {
@@ -113,22 +113,21 @@ func (w *Worker) process(ctx context.Context, event Event) error {
 	trace.Emit("resend_fetch", "success", "Received email content from Resend.")
 	destinations := event.Destinations
 	if len(event.Email.To) == 0 {
-		destinations, err = w.router.Match(email.To)
+		destinations, err = w.router.Match(email.To, email.From)
 		if err != nil {
 			return w.retry(event, trace, "routing", err)
 		}
 	} else {
 		matched := destinations[:0]
 		for _, destination := range destinations {
-			filter, _ := message.NewRecipientFilter(destination.Inbound)
-			if filter.Matches(email.To) {
+			if destination.Matches(email.To, email.From) {
 				matched = append(matched, destination)
 			}
 		}
 		destinations = matched
 	}
 	if len(destinations) == 0 {
-		trace.Emit("routing", "skipped", "No queued destination matched the retrieved To recipients; email ignored.")
+		trace.Emit("routing", "skipped", "No queued destination matched the retrieved recipient and sender; email ignored.")
 		return w.queue.CompleteIntake(context.Background(), event.Email.ID, "ignored")
 	}
 	names := make([]string, 0, len(destinations))

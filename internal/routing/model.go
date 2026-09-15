@@ -5,6 +5,8 @@ package routing
 import (
 	"encoding/json"
 	"fmt"
+	"net/mail"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +28,7 @@ type Route struct {
 	ID           string    `json:"id"`
 	Name         string    `json:"name"`
 	Inbound      string    `json:"inbound"`
+	FromDomain   string    `json:"from_domain,omitempty"`
 	ConnectionID string    `json:"connection_id"`
 	ObjectID     string    `json:"object_id"`
 	Singular     string    `json:"singular"`
@@ -35,6 +38,7 @@ type Route struct {
 }
 type Destination struct {
 	Inbound      string    `json:"inbound"`
+	FromDomain   string    `json:"from_domain,omitempty"`
 	RouteID      string    `json:"route_id"`
 	RouteName    string    `json:"route_name"`
 	ConnectionID string    `json:"connection_id"`
@@ -44,12 +48,26 @@ type Destination struct {
 	Legacy       bool      `json:"legacy,omitempty"`
 }
 
-func (r Route) Matches(to []string) bool {
+var domainPattern = regexp.MustCompile(`(?i)^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+
+func (r Route) Matches(to []string, from string) bool {
 	f, err := message.NewRecipientFilter(r.Inbound)
-	return err == nil && strings.TrimSpace(r.Inbound) != "" && r.Enabled && f.Matches(to)
+	return err == nil && strings.TrimSpace(r.Inbound) != "" && r.Enabled && f.Matches(to) && (r.FromDomain == "" || from == "" || matchesDomain(from, r.FromDomain))
 }
 func (r Route) Snapshot() Destination {
-	return Destination{Inbound: r.Inbound, RouteID: r.ID, RouteName: r.Name, ConnectionID: r.ConnectionID, Singular: r.Singular, Plural: r.Plural, Mappings: append([]Mapping(nil), r.Mappings...)}
+	return Destination{Inbound: r.Inbound, FromDomain: r.FromDomain, RouteID: r.ID, RouteName: r.Name, ConnectionID: r.ConnectionID, Singular: r.Singular, Plural: r.Plural, Mappings: append([]Mapping(nil), r.Mappings...)}
+}
+func (d Destination) Matches(to []string, from string) bool {
+	f, err := message.NewRecipientFilter(d.Inbound)
+	return err == nil && f.Matches(to) && (d.FromDomain == "" || matchesDomain(from, d.FromDomain))
+}
+func matchesDomain(from, allowed string) bool {
+	address, err := mail.ParseAddress(strings.TrimSpace(from))
+	if err != nil {
+		return false
+	}
+	at := strings.LastIndexByte(address.Address, '@')
+	return at > 0 && strings.EqualFold(address.Address[at+1:], allowed)
 }
 func (d Destination) RecordID(emailID string) string {
 	if d.Legacy {
@@ -64,6 +82,10 @@ func Validate(route *Route, object twenty.Object) error {
 	}
 	if _, err := message.NewRecipientFilter(route.Inbound); err != nil {
 		return err
+	}
+	route.FromDomain = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(route.FromDomain), "@")))
+	if len(route.FromDomain) > 253 || (route.FromDomain != "" && !domainPattern.MatchString(route.FromDomain)) {
+		return fmt.Errorf("allowed sender domain must be a domain such as example.com")
 	}
 	if !object.Valid() || route.ObjectID != object.ID {
 		return fmt.Errorf("select a valid object")

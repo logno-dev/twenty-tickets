@@ -21,9 +21,11 @@ func (f receiverFunc) Receive(ctx context.Context, id string) (resend.Email, err
 	return f(ctx, id)
 }
 
-type routerFunc func([]string) ([]routing.Destination, error)
+type routerFunc func([]string, string) ([]routing.Destination, error)
 
-func (f routerFunc) Match(to []string) ([]routing.Destination, error) { return f(to) }
+func (f routerFunc) Match(to []string, from string) ([]routing.Destination, error) {
+	return f(to, from)
+}
 
 func ptr(s string) *string { return &s }
 
@@ -55,7 +57,9 @@ func TestWorkerRetriesOutsideWebhookAndPreservesHistory(t *testing.T) {
 		}
 		return resend.Email{ID: id, Subject: "Fwd: Printer", From: "user@example.com", To: []string{"Support <support@example.com>"}, Text: ptr(rawBody)}, nil
 	})
-	w := intake.New(queue, receiver, store, routerFunc(func([]string) ([]routing.Destination, error) { return nil, fmt.Errorf("unexpected fallback routing") }), queue, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	w := intake.New(queue, receiver, store, routerFunc(func([]string, string) ([]routing.Destination, error) {
+		return nil, fmt.Errorf("unexpected fallback routing")
+	}), queue, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err := w.Process(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +129,7 @@ func TestWorkerFallsBackToFetchedRecipientsAndRecoversSavedDraft(t *testing.T) {
 		fetches++
 		return resend.Email{ID: "email", To: []string{"support@example.com"}, Text: ptr("Body")}, nil
 	})
-	router := routerFunc(func(to []string) ([]routing.Destination, error) {
+	router := routerFunc(func(to []string, from string) ([]routing.Destination, error) {
 		return []routing.Destination{{RouteID: "route", Inbound: "support@example.com"}}, nil
 	})
 	w := intake.New(queue, receiver, store, router, queue, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -143,5 +147,46 @@ func TestWorkerFallsBackToFetchedRecipientsAndRecoversSavedDraft(t *testing.T) {
 	}
 	if fetches != 1 {
 		t.Fatal("existing draft was fetched again")
+	}
+}
+
+func TestWorkerRejectsRetrievedSenderOutsideSnapshottedDomain(t *testing.T) {
+	dir := t.TempDir()
+	queue, err := config.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	store, err := inbox.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := intake.Event{
+		Version:   1,
+		WebhookID: "webhook",
+		Email:     resend.Email{ID: "restricted", From: "user@somedomain.com", To: []string{"support@example.com"}},
+		Destinations: []routing.Destination{{
+			RouteID: "route", Inbound: "support@example.com", FromDomain: "somedomain.com",
+		}},
+		QueuedAt: time.Now().UTC(),
+	}
+	if _, err := queue.EnqueueIntake(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	receiver := receiverFunc(func(context.Context, string) (resend.Email, error) {
+		return resend.Email{ID: "restricted", From: "attacker@other.com", To: []string{"support@example.com"}, Text: ptr("Body")}, nil
+	})
+	router := routerFunc(func([]string, string) ([]routing.Destination, error) {
+		return nil, fmt.Errorf("unexpected fallback routing")
+	})
+	w := intake.New(queue, receiver, store, router, queue, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := w.Process(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if exists, err := store.Exists("restricted"); err != nil || exists {
+		t.Fatal("disallowed sender created a draft")
+	}
+	if due, err := queue.DueIntake(context.Background(), time.Now().Add(time.Hour), 10); err != nil || len(due) != 0 {
+		t.Fatal("ignored sender remained queued")
 	}
 }

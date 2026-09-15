@@ -31,18 +31,18 @@ func TestConfigurationPersistenceEncryptionAndSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Match([]string{"support@example.com"}); err == nil {
+	if _, err := s.Match([]string{"support@example.com"}, "user@example.com"); err == nil {
 		t.Fatal("unconfigured installation should request a retry")
 	}
 	id, err := s.SaveConnection(context.Background(), "", "Company A", srv.URL, key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	route := routing.Route{Name: "Support", Inbound: "support@example.com", ConnectionID: id, ObjectID: "obj", Enabled: true, Mappings: []routing.Mapping{{Field: "name", Source: "subject"}}}
+	route := routing.Route{Name: "Support", Inbound: "support@example.com", FromDomain: "somedomain.com", ConnectionID: id, ObjectID: "obj", Enabled: true, Mappings: []routing.Mapping{{Field: "name", Source: "subject"}}}
 	if err := s.SaveRoute(route); err != nil {
 		t.Fatal(err)
 	}
-	matched, err := s.Match([]string{"Support <SUPPORT@example.com>"})
+	matched, err := s.Match([]string{"Support <SUPPORT@example.com>"}, "User <user@somedomain.com>")
 	if err != nil || len(matched) != 1 {
 		t.Fatalf("match: %v %v", matched, err)
 	}
@@ -54,11 +54,14 @@ func TestConfigurationPersistenceEncryptionAndSnapshots(t *testing.T) {
 	if err := s.SaveRoute(route); err != nil {
 		t.Fatal(err)
 	}
-	if current, err := s.Match([]string{"support@example.com"}); err != nil || len(current) != 0 {
+	if current, err := s.Match([]string{"support@example.com"}, "user@example.com"); err != nil || len(current) != 0 {
 		t.Fatal("disabled route still matches")
 	}
 	if got, _ := json.Marshal(matched); !bytes.Equal(got, snapshot) {
 		t.Fatal("accepted snapshot mutated")
+	}
+	if matched[0].FromDomain != "somedomain.com" {
+		t.Fatal("sender restriction missing from snapshot")
 	}
 	if _, err := s.SaveConnection(context.Background(), id, "Changed", srv.URL+"/other", key); err == nil {
 		t.Fatal("existing destination redirected")

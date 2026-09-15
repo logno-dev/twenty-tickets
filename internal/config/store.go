@@ -270,7 +270,7 @@ func (s *Store) SaveRoute(route routing.Route) error {
 	_, err = s.db.Exec(`INSERT INTO routes(id,connection_id,definition) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET connection_id=excluded.connection_id,definition=excluded.definition`, route.ID, route.ConnectionID, raw)
 	return err
 }
-func (s *Store) Match(to []string) ([]routing.Destination, error) {
+func (s *Store) Match(to []string, from string) ([]routing.Destination, error) {
 	routes, err := s.Routes()
 	if err != nil {
 		return nil, err
@@ -280,7 +280,7 @@ func (s *Store) Match(to []string) ([]routing.Destination, error) {
 	}
 	var destinations []routing.Destination
 	for _, r := range routes {
-		if r.Matches(to) {
+		if r.Matches(to, from) {
 			destinations = append(destinations, r.Snapshot())
 		}
 	}

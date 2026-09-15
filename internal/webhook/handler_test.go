@@ -32,9 +32,11 @@ func signedRequest(body string, timestamp time.Time) *http.Request {
 	return r
 }
 
-type routerFunc func([]string) ([]routing.Destination, error)
+type routerFunc func([]string, string) ([]routing.Destination, error)
 
-func (f routerFunc) Match(to []string) ([]routing.Destination, error) { return f(to) }
+func (f routerFunc) Match(to []string, from string) ([]routing.Destination, error) {
+	return f(to, from)
+}
 
 type failingQueue struct{}
 
@@ -48,7 +50,10 @@ func TestWebhookValidationAndDurableQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer settings.Close()
-	router := routerFunc(func(to []string) ([]routing.Destination, error) {
+	router := routerFunc(func(to []string, from string) ([]routing.Destination, error) {
+		if from != "user@example.com" {
+			t.Errorf("sender metadata not passed to router: %q", from)
+		}
 		if len(to) == 0 {
 			return nil, nil
 		}
@@ -126,9 +131,11 @@ func TestWebhookRoutingAndQueueFailures(t *testing.T) {
 		router Router
 		status int
 	}{
-		{"queue failure", failingQueue{}, routerFunc(func([]string) ([]routing.Destination, error) { return []routing.Destination{{RouteID: "route"}}, nil }), 503},
-		{"router failure", failingQueue{}, routerFunc(func([]string) ([]routing.Destination, error) { return nil, fmt.Errorf("no routes") }), 503},
-		{"unmatched", failingQueue{}, routerFunc(func([]string) ([]routing.Destination, error) { return nil, nil }), 204},
+		{"queue failure", failingQueue{}, routerFunc(func([]string, string) ([]routing.Destination, error) {
+			return []routing.Destination{{RouteID: "route"}}, nil
+		}), 503},
+		{"router failure", failingQueue{}, routerFunc(func([]string, string) ([]routing.Destination, error) { return nil, fmt.Errorf("no routes") }), 503},
+		{"unmatched", failingQueue{}, routerFunc(func([]string, string) ([]routing.Destination, error) { return nil, nil }), 204},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			h, err := New(secret, tt.queue, slog.New(slog.NewTextHandler(io.Discard, nil)), tt.router, nil)

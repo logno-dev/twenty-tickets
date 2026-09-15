@@ -315,7 +315,7 @@ func fieldsFor(object twenty.Object, mappings []routing.Mapping) []fieldView {
 	return result
 }
 func (h *Handler) saveRoute(w http.ResponseWriter, r *http.Request) {
-	route := routing.Route{ID: r.PostForm.Get("id"), Name: r.PostForm.Get("name"), Inbound: strings.TrimSpace(r.PostForm.Get("inbound")), ConnectionID: r.PostForm.Get("connection"), ObjectID: r.PostForm.Get("object"), Enabled: r.PostForm.Get("enabled") == "on"}
+	route := routing.Route{ID: r.PostForm.Get("id"), Name: r.PostForm.Get("name"), Inbound: strings.TrimSpace(r.PostForm.Get("inbound")), FromDomain: strings.TrimSpace(r.PostForm.Get("from_domain")), ConnectionID: r.PostForm.Get("connection"), ObjectID: r.PostForm.Get("object"), Enabled: r.PostForm.Get("enabled") == "on"}
 	c, err := h.store.Connection(route.ConnectionID)
 	if err != nil {
 		h.fail(w, err)
@@ -349,8 +349,8 @@ func (h *Handler) assign(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, err)
 		return
 	}
-	if !route.Matches(d.Email.To) || route.Singular != "ticket" || route.Plural != "tickets" {
-		h.fail(w, fmt.Errorf("select an enabled tickets route matching the draft's To address"))
+	if !route.Matches(d.Email.To, d.Email.From) || route.Singular != "ticket" || route.Plural != "tickets" {
+		h.fail(w, fmt.Errorf("select an enabled tickets route matching the draft's recipient and sender restrictions"))
 		return
 	}
 	if err := h.inbox.AssignLegacy(d.Email.ID, route.Snapshot()); err != nil {

@@ -22,7 +22,7 @@ type Queue interface {
 }
 
 type Router interface {
-	Match([]string) ([]routing.Destination, error)
+	Match([]string, string) ([]routing.Destination, error)
 }
 
 func New(secret string, queue Queue, log *slog.Logger, router Router, recorder activity.Recorder) (http.Handler, error) {
@@ -75,8 +75,8 @@ func New(secret string, queue Queue, log *slog.Logger, router Router, recorder a
 		trace.Emit("webhook_received", "success", "Received email.received webhook.")
 		trace.Emit("signature_verified", "success", "Signature and timestamp verified.")
 		ignore := func() {
-			trace.Emit("routing", "skipped", "No matching destination for the email's To recipients; email ignored.")
-			log.Info("email ignored", "email_id", id, "reason", "recipient_mismatch")
+			trace.Emit("routing", "skipped", "No destination matched the email's recipient and sender restrictions; email ignored.")
+			log.Info("email ignored", "email_id", id, "reason", "route_mismatch")
 			w.WriteHeader(http.StatusNoContent)
 		}
 		fail := func(stage string, err error) {
@@ -88,8 +88,8 @@ func New(secret string, queue Queue, log *slog.Logger, router Router, recorder a
 		// later configuration changes cannot retarget an accepted email.
 		var destinations []routing.Destination
 		if len(event.Data.To) > 0 {
-			trace.Emit("routing", "running", "Matching verified To recipients against enabled routes.")
-			destinations, err = router.Match(event.Data.To)
+			trace.Emit("routing", "running", "Matching verified recipients and sender against enabled routes.")
+			destinations, err = router.Match(event.Data.To, event.Data.From)
 			if err != nil {
 				fail("routing", err)
 				return

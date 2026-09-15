@@ -62,18 +62,19 @@ Choose **Add route**:
 1. Select a connection, then **Load objects**.
 2. Select an object from its schema, then **Load fields**.
 3. Enter a route name and a specific inbound **To** email address.
-4. Choose each field's value source, enable the route, and save.
+4. Optionally enter an allowed sender domain such as `somedomain.com`.
+5. Choose each field's value source, enable the route, and save.
 
 Example:
 
-| Route | Inbound address | Connection | Object |
-| --- | --- | --- | --- |
-| Company A support | `support@company-a.com` | Company A | `tickets` |
-| Company B support | `support@company-b.com` | Company B | `tickets` |
+| Route | Inbound address | Allowed sender | Connection | Object |
+| --- | --- | --- | --- | --- |
+| Company A support | `support@company-a.com` | `customer-a.com` | Company A | `tickets` |
+| Company B support | `support@company-b.com` | Any domain | Company B | `tickets` |
 
 An email matching both routes produces one record per route. Multiple routes can also share one connection. Each route has its own stable record identity; two matching routes intentionally create two records even if they target the same object in the same workspace.
 
-Matching is case-insensitive and compares the complete mailbox. Display names are supported; plus tags and aliases are distinct. CC/BCC, senders, and headers inside forwarded text do not count. Routing uses Resend's outer `to` data, not SMTP-envelope or forwarding-header inference.
+Recipient matching is case-insensitive and compares the complete mailbox. Display names are supported; plus tags and aliases are distinct. CC/BCC and headers inside forwarded text do not count. When configured, the sender restriction parses Resend's outer `From` mailbox and compares its domain case-insensitively. It is an exact match: `somedomain.com` does not allow `sub.somedomain.com`. Leave it blank to accept any sender. Both recipient and sender are confirmed against the retrieved email before a draft is created. This is a From-header filter, not a substitute for SPF, DKIM, or DMARC authentication.
 
 ### Field mapping
 
@@ -154,7 +155,7 @@ The old `check-twenty` CLI command is replaced by the connection form's test/ref
 ## Processing and reliability
 
 1. Verify the raw webhook with the official Svix library, including timestamp tolerance.
-2. Match enabled routes using the signed event's To recipients when provided. Unmatched events are skipped before fetching content.
+2. Match enabled routes using the signed event's To recipients and optional sender-domain restrictions when provided. Unmatched events are skipped before fetching content.
 3. Commit the event metadata and immutable destination/mapping snapshots to SQLite, then return `204`. Duplicate webhook deliveries resolve to the same queue entry by Resend email ID.
 4. A background intake worker fetches `GET https://api.resend.com/emails/receiving/{id}?html_format=cid` independently of the webhook connection. If the signed event omitted To, it routes using the fetched recipients; otherwise it confirms the snapshots against them.
 5. Extract the message and atomically save a version-2 draft. Retrieval or storage failures remain queued and retry after 30 seconds, doubling to a 30-minute cap.
